@@ -1,6 +1,6 @@
 {
   "name": "pi-github-copilot-auto",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Adds a github-copilot-auto/auto model to pi that follows GitHub Copilot's server-side auto model selection (intent router).",
   "keywords": [
     "pi-package",
@@ -11,9 +11,6 @@
   ],
   "license": "MIT",
   "type": "module",
-  "exports": {
-    ".": "./index.ts"
-  },
   "files": [
     "index.ts",
     "README.md",

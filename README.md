@@ -81,12 +81,6 @@ pi list
 
 ## Usage
 
-Pick **`github-copilot-auto/auto`** in the model picker (`/model`), or:
-
-```sh
-pi --provider github-copilot-auto --model auto
-```
-
 The routing decision for each conversation is shown as a transient toast
 (`Auto → gpt-5.4 · no_reasoning`) and in the footer status (`auto → gpt-5.4`).
 
