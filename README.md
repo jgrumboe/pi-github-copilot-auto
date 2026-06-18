@@ -8,30 +8,17 @@ This is a port of
 [opencode-github-copilot-auto-model](https://github.com/m0wer/opencode-github-copilot-auto-model)
 to pi's extension/provider API.
 
-## Why it works better on pi than on opencode
+## How it works
 
-GitHub Copilot "auto" is backed by two server calls on the Copilot API host:
+GitHub Copilot "auto" uses two server calls on the Copilot API host:
 
-1. `POST /models/session` — opens an auto session: returns the candidate model pool
-   (`available_models`) and a `Copilot-Session-Token` (places requests in the auto
-   billing/rate‑limit pool, with the ~10% discount).
-2. `POST /models/session/intent` — the **intent router**: classifies the prompt as
-   `needs_reasoning` / `no_reasoning` and returns a ranked `candidate_models` list
-   plus a `chosen_model`.
+1. `POST /models/session` — opens an auto session and returns the candidate model pool
+   (`available_models`) plus a `Copilot-Session-Token`.
+2. `POST /models/session/intent` — the intent router, which classifies the prompt and
+   returns `candidate_models` and `chosen_model`.
 
-The intent router is **gated to first‑party clients**. opencode's OAuth client ID
-gets a `404`, so its plugin usually falls back to the plain availability pick.
-
-**pi already authenticates its GitHub Copilot provider as
-`Copilot-Integration-Id: vscode-chat` using VS Code's GitHub App client ID** — which
-is exactly the gate the router checks. So this plugin gets *genuine* per‑prompt ML
-routing decisions.
-
-Second advantage: pi lets the plugin implement a custom `streamSimple`, so each routed
-turn delegates to the **target model's own endpoint family**. There is no single‑endpoint
-"within‑family" constraint — Claude for reasoning **and** GPT for fast both work in the
-same picker entry (the opencode port could not do this without a proxy).
-
+This package opens the auto session, asks the intent router, and then delegates the
+request to the selected model through pi's provider stream.
 ## Install (pi package)
 
 ### 1) Install the package from GitHub
@@ -111,15 +98,6 @@ The routing decision for each conversation is shown as a transient toast
   the plugin tries the next Copilot-provided candidates for that turn.
 - **After compaction**, only the compacted conversation's routing cache is invalidated
   and re-evaluated next turn.
-
-## Pure auto mode
-
-This plugin now runs in **pure auto** mode only:
-
-- No local preference override (`preferredModels`, `reasoning`, `noReasoning` removed)
-- No local effort override (`boostReasoningEffort` removed)
-- Selection follows Copilot's router/session output (`chosen_model`, `candidate_models`,
-  then session defaults) and policy-filtered pool
 
 ## Optional configuration
 
