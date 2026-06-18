@@ -13,6 +13,7 @@
   "type": "module",
   "files": [
     "index.ts",
+    ".npmrc",
     "README.md",
     "LICENSE",
     "package.json"
