@@ -1,9 +1,38 @@
 {
   "name": "pi-github-copilot-auto",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Adds a github-copilot-auto/auto model to pi that follows GitHub Copilot's server-side auto model selection (intent router).",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "github-copilot",
+    "copilot",
+    "ai"
+  ],
+  "license": "MIT",
   "type": "module",
-  "private": true,
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jgrumboe/pi-github-copilot-auto.git"
+  },
+  "homepage": "https://github.com/jgrumboe/pi-github-copilot-auto#readme",
+  "bugs": {
+    "url": "https://github.com/jgrumboe/pi-github-copilot-auto/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
