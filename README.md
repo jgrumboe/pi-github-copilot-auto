@@ -93,6 +93,25 @@ The routing decision for each conversation is shown as a transient toast
 - **After compaction**, only the compacted conversation's routing cache is invalidated
   and re-evaluated next turn.
 
+## Models in the auto pool
+
+The following models are available under GitHub Copilot's Auto model selection.
+The actual pool returned per request may vary by plan and policy.
+
+| Model | Provider |
+|-------|----------|
+| GPT-5 mini | OpenAI |
+| GPT-5.3-Codex | OpenAI |
+| GPT-5.4 | OpenAI |
+| GPT-5.4 mini | OpenAI |
+| Claude Haiku 4.5 | Anthropic |
+| Claude Sonnet 4.6 | Anthropic |
+| MAI-Code-1-Flash | Microsoft |
+| Raptor mini | Microsoft |
+
+> Source: [Supported AI models in GitHub Copilot — Auto model selection](https://docs.github.com/en/copilot/reference/ai-models/supported-models#supported-ai-models-in-auto-model-selection)  
+> Model availability is subject to change.
+
 ## Optional configuration
 
 Create `~/.pi/agent/github-copilot-auto.json` (all fields optional):
