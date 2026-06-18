@@ -32,39 +32,46 @@ turn delegates to the **target model's own endpoint family**. There is no single
 "within‑family" constraint — Claude for reasoning **and** GPT for fast both work in the
 same picker entry (the opencode port could not do this without a proxy).
 
-## Install (first-time pi users)
+## Install (pi package)
 
-This extension is loaded from pi's global auto-discovery directory
-(`~/.pi/agent/extensions/`).
-
-### 1) Clone the plugin into pi's extensions folder
+### 1) Install the package from GitHub
 
 ```bash
-mkdir -p ~/.pi/agent/extensions
-git clone https://github.com/redbullmediahouse-playground/pi-github-copilot-auto.git \
-  ~/.pi/agent/extensions/github-copilot-auto
+pi install git:github.com/jgrumboe/pi-github-copilot-auto
 ```
 
-### 2) Start pi and reload extensions
+(Optional, project-local instead of global settings)
+
+```bash
+pi install -l git:github.com/jgrumboe/pi-github-copilot-auto
+```
+
+### 2) Reload package resources
+
+Inside pi:
 
 ```text
 /reload
 ```
 
-(If pi was not running yet, just start `pi`; no extra build step is needed.)
+(If pi was not running yet, just start `pi`.)
 
-### 3) Log in to GitHub Copilot once in pi
+### 3) Log in to GitHub Copilot once
+
+Inside pi:
 
 ```text
 /login
 ```
 
-Then choose **GitHub Copilot** in the login flow.
+Then choose **GitHub Copilot**.
 
-The plugin reuses those credentials from `~/.pi/agent/auth.json` (including token
-refresh). No separate auth flow is required.
+The plugin reuses the existing credentials from `~/.pi/agent/auth.json`
+(with automatic token refresh). No separate auth flow is required.
 
-### 4) Select the model
+### 4) Select and use Auto
+
+Inside pi:
 
 ```text
 /model
@@ -72,11 +79,18 @@ refresh). No separate auth flow is required.
 
 Pick **`github-copilot-auto/auto`**.
 
-You can also run directly from shell:
+Or run from shell:
 
 ```bash
 pi --provider github-copilot-auto --model auto
 ```
+
+### 5) Verify package install (optional)
+
+```bash
+pi list
+```
+
 
 ## Usage
 
