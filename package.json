@@ -1,0 +1,11 @@
+{
+  "name": "pi-github-copilot-auto",
+  "version": "0.1.0",
+  "description": "Adds a github-copilot-auto/auto model to pi that follows GitHub Copilot's server-side auto model selection (intent router).",
+  "type": "module",
+  "private": true,
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
