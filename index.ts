@@ -21,10 +21,6 @@
  *
  * Optional config: ~/.pi/agent/github-copilot-auto.json
  *   {
- *     "preferredModels": ["claude-sonnet-4.6", "gpt-5.4"],
- *     "reasoning":       ["claude-sonnet-4.6"],
- *     "noReasoning":     ["gpt-5.4-mini"],
- *     "boostReasoningEffort": true,
  *     "contextWindow": 200000,
  *     "maxTokens": 64000,
  *     "debug": false
@@ -81,10 +77,6 @@ const VSCODE_DEVICE_ID = randomUUID();
 // ---------------------------------------------------------------------------
 
 type Config = {
-	preferredModels?: string[];
-	reasoning?: string[];
-	noReasoning?: string[];
-	boostReasoningEffort?: boolean;
 	contextWindow?: number;
 	maxTokens?: number;
 	debug?: boolean;
@@ -321,42 +313,53 @@ async function fetchIntent(
 const catalog = new Map<string, Model<Api>>();
 for (const m of getModels(SOURCE_PROVIDER) as Model<Api>[]) catalog.set(m.id, m);
 
-function normalize(list?: string[]): string[] {
-	if (!list?.length) return [];
+function dedupe(values: string[]): string[] {
 	const out: string[] = [];
-	for (const v of list) {
-		const s = v.trim();
-		if (s && !out.includes(s)) out.push(s);
+	for (const value of values) {
+		if (!value || out.includes(value)) continue;
+		out.push(value);
 	}
 	return out;
 }
 
-const PREFERRED = normalize(config.preferredModels);
-const REASONING = normalize(config.reasoning);
-const NO_REASONING = normalize(config.noReasoning);
+function routablePool(session: AutoSession): string[] {
+	return session.availableModels.filter((id) => catalog.has(id));
+}
 
-/** Choose a model id that is both routable (in pi's catalog) and in the pool. */
-function selectModel(decision: RouterDecision | undefined, session: AutoSession): { id: string; label?: string } | undefined {
-	const pool = session.availableModels.filter((id) => catalog.has(id));
+/** Pure auto mode: trust Copilot router/session, no local preference override. */
+function selectModel(decision: RouterDecision | undefined, session: AutoSession): { id: string; label?: string; candidates: string[] } | undefined {
+	const pool = routablePool(session);
 	if (!pool.length) return undefined;
 
 	const label = decision?.predicted_label;
-	const prefs =
-		label === "needs_reasoning" && REASONING.length
-			? REASONING
-			: label === "no_reasoning" && NO_REASONING.length
-				? NO_REASONING
-				: PREFERRED;
+	const candidates = (decision?.candidate_models ?? []).filter((id) => pool.includes(id));
+	const chosen =
+		(decision?.chosen_model && pool.includes(decision.chosen_model) ? decision.chosen_model : undefined) ??
+		candidates[0] ??
+		(session.selectedModel && pool.includes(session.selectedModel) ? session.selectedModel : undefined) ??
+		pool[0];
 
-	// 1) explicit preference that is in the pool
-	for (const p of prefs) if (pool.includes(p)) return { id: p, label };
-	// 2) router's chosen model
-	if (decision?.chosen_model && pool.includes(decision.chosen_model)) return { id: decision.chosen_model, label };
-	// 3) first routable candidate
-	for (const c of decision?.candidate_models ?? []) if (pool.includes(c)) return { id: c, label };
-	// 4) session default / first in pool
-	if (session.selectedModel && pool.includes(session.selectedModel)) return { id: session.selectedModel, label };
-	return { id: pool[0], label };
+	return { id: chosen, label, candidates };
+}
+
+function buildAttemptOrder(primaryId: string, extraCandidates: string[] | undefined, session: AutoSession): string[] {
+	const pool = routablePool(session);
+	return dedupe([primaryId, ...(extraCandidates ?? []), ...(session.selectedModel ? [session.selectedModel] : []), ...pool]);
+}
+
+function isRetriableProviderError(message: string): boolean {
+	const text = message.toLowerCase();
+	return (
+		/\b(429|500|502|503|504|408)\b/.test(text) ||
+		text.includes("rate limit") ||
+		text.includes("temporarily unavailable") ||
+		text.includes("overloaded") ||
+		text.includes("timeout") ||
+		text.includes("timed out") ||
+		text.includes("econnreset") ||
+		text.includes("socket hang up") ||
+		text.includes("network")
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +371,7 @@ type ConvState = {
 	sessionInflight?: Promise<AutoSession | undefined>;
 	routedModelId?: string;
 	routedLabel?: string;
+	routedCandidates?: string[];
 	turn: number;
 };
 
@@ -466,15 +470,10 @@ function delegateStream(
 	options: SimpleStreamOptions | undefined,
 	token: string,
 	sessionToken: string,
-	label: string | undefined,
 ): AssistantMessageEventStream {
 	const headers = { ...(options?.headers ?? {}), "Copilot-Session-Token": sessionToken };
-	const reasoning =
-		config.boostReasoningEffort && label === "needs_reasoning" && target.reasoning
-			? "high"
-			: options?.reasoning;
 	// Override the placeholder provider apiKey with the resolved Copilot token.
-	const innerOptions: SimpleStreamOptions = { ...options, apiKey: token, headers, reasoning };
+	const innerOptions: SimpleStreamOptions = { ...options, apiKey: token, headers };
 
 	switch (target.api) {
 		case "anthropic-messages":
@@ -539,23 +538,75 @@ function streamAuto(_model: Model<Api>, context: Context, options?: SimpleStream
 				label = picked.label;
 				conv.routedModelId = chosenId;
 				conv.routedLabel = label;
+				conv.routedCandidates = picked.candidates;
 				announce(chosenId, label);
 				log(`routed ${convKey} -> ${chosenId} (label=${label ?? "n/a"})`);
 			}
 
 			conv.turn += 1;
+			const attempts = buildAttemptOrder(chosenId, conv.routedCandidates, session);
+			let lastErrorEvent: { type: "error"; error?: { errorMessage?: string } } | undefined;
 
-			const base = catalog.get(chosenId);
-			if (!base) {
-				for await (const e of errorStream(`Routed model not in catalog: ${chosenId}`)) out.push(e);
+			for (let i = 0; i < attempts.length; i++) {
+				const attemptId = attempts[i];
+				const base = catalog.get(attemptId);
+				if (!base) continue;
+
+				// Delegate to the routed model's own endpoint family, on the Copilot host.
+				const target: Model<Api> = { ...base, provider: SOURCE_PROVIDER, baseUrl: auth.baseUrl };
+				const inner = delegateStream(target, context, options, auth.token, session.sessionToken);
+
+				let committed = false;
+				let sawError = false;
+				let errorMessage = "";
+				const preCommitBuffer: unknown[] = [];
+
+				for await (const event of inner as AsyncIterable<unknown>) {
+					const ev = event as { type?: string; error?: { errorMessage?: string } };
+					if (!committed) {
+						if (ev.type === "error") {
+							sawError = true;
+							errorMessage = ev.error?.errorMessage ?? "Unknown upstream error";
+							lastErrorEvent = ev as { type: "error"; error?: { errorMessage?: string } };
+							break;
+						}
+						preCommitBuffer.push(event);
+						if (ev.type && ev.type !== "start") {
+							committed = true;
+							for (const buffered of preCommitBuffer) out.push(buffered as never);
+						}
+						continue;
+					}
+					out.push(event as never);
+				}
+
+				if (sawError && !committed) {
+					const retriable = isRetriableProviderError(errorMessage);
+					const hasAnother = i < attempts.length - 1;
+					log(
+						`attempt failed ${attemptId} retriable=${String(retriable)} next=${String(hasAnother)} msg=${errorMessage}`,
+					);
+					if (retriable && hasAnother) continue;
+					if (lastErrorEvent) out.push(lastErrorEvent as never);
+					else for await (const e of errorStream(errorMessage)) out.push(e as never);
+					out.end();
+					return;
+				}
+
+				if (!committed) {
+					for (const buffered of preCommitBuffer) out.push(buffered as never);
+				}
+
+				if (attemptId !== chosenId) {
+					conv.routedModelId = attemptId;
+					announce(attemptId, label);
+					log(`fallback promoted ${chosenId} -> ${attemptId}`);
+				}
 				out.end();
 				return;
 			}
 
-			// Delegate to the routed model's own endpoint family, on the Copilot host.
-			const target: Model<Api> = { ...base, provider: SOURCE_PROVIDER, baseUrl: auth.baseUrl };
-			const inner = delegateStream(target, context, options, auth.token, session.sessionToken, label);
-			for await (const e of inner) out.push(e);
+			for await (const e of errorStream("All candidate auto models failed.")) out.push(e);
 			out.end();
 		} catch (e) {
 			for await (const ev of errorStream(e instanceof Error ? e.message : String(e))) out.push(ev);
@@ -606,10 +657,33 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_e, ctx) => capture(ctx as never));
 
-	// Reset sticky routing when a conversation is compacted.
-	pi.on("session_compact", async (_e, ctx) => {
+	const compactedSessionKey = (event: unknown): string | undefined => {
+		if (!event || typeof event !== "object") return undefined;
+		const e = event as {
+			sessionID?: unknown;
+			sessionId?: unknown;
+			properties?: { sessionID?: unknown; sessionId?: unknown };
+		};
+		const direct = typeof e.sessionID === "string" ? e.sessionID : typeof e.sessionId === "string" ? e.sessionId : undefined;
+		if (direct) return direct;
+		return typeof e.properties?.sessionID === "string"
+			? e.properties.sessionID
+			: typeof e.properties?.sessionId === "string"
+				? e.properties.sessionId
+				: undefined;
+	};
+
+	// Reset sticky routing only for the compacted conversation.
+	pi.on("session_compact", async (event, ctx) => {
 		capture(ctx as never);
+		const key = compactedSessionKey(event);
+		if (key) {
+			conversations.delete(key);
+			log(`routing cache cleared for compacted session ${key}`);
+			return;
+		}
+		// Fallback for unknown payload shapes.
 		conversations.clear();
-		log("routing cache cleared (compaction)");
+		log("routing cache cleared (compaction fallback: unknown session key)");
 	});
 }
