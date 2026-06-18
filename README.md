@@ -71,7 +71,19 @@ The routing decision for each conversation is shown as a transient toast
 
 - **Turn 0** of a conversation calls the intent router and picks a model.
 - **Turns 1+** reuse that pick (KV‑cache stability, like VS Code).
-- **After compaction** the routing cache is cleared and re‑evaluated next turn.
+- If the chosen model fails with a **retriable upstream error** (429/5xx/timeout/network),
+  the plugin tries the next Copilot-provided candidates for that turn.
+- **After compaction**, only the compacted conversation's routing cache is invalidated
+  and re-evaluated next turn.
+
+## Pure auto mode
+
+This plugin now runs in **pure auto** mode only:
+
+- No local preference override (`preferredModels`, `reasoning`, `noReasoning` removed)
+- No local effort override (`boostReasoningEffort` removed)
+- Selection follows Copilot's router/session output (`chosen_model`, `candidate_models`,
+  then session defaults) and policy-filtered pool
 
 ## Optional configuration
 
@@ -79,17 +91,6 @@ Create `~/.pi/agent/github-copilot-auto.json` (all fields optional):
 
 ```jsonc
 {
-  // Ordered fallback list; first model present in the session pool wins,
-  // regardless of routing label. Use pi model ids (e.g. "claude-sonnet-4.6").
-  "preferredModels": ["claude-sonnet-4.6", "gpt-5.4"],
-
-  // Per-label preferences: steer the pick by the router verdict.
-  "reasoning":   ["claude-sonnet-4.6"],
-  "noReasoning": ["gpt-5.4-mini"],
-
-  // Raise reasoning effort to "high" on needs_reasoning turns (boost-only).
-  "boostReasoningEffort": true,
-
   // The auto picker entry advertises these limits to pi's context manager.
   // Keep contextWindow conservative if your pool mixes 200K and 1M models.
   "contextWindow": 200000,
@@ -102,16 +103,9 @@ Create `~/.pi/agent/github-copilot-auto.json` (all fields optional):
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `preferredModels` | string[] | Ordered fallback; first pool match wins. |
-| `reasoning` | string[] | Preferred model(s) when the router returns `needs_reasoning`. |
-| `noReasoning` | string[] | Preferred model(s) when the router returns `no_reasoning`. |
-| `boostReasoningEffort` | boolean | Raise effort to `high` on reasoning turns. |
 | `contextWindow` | number | Context window advertised for the `auto` entry (default 200000). |
 | `maxTokens` | number | Max output tokens advertised for the `auto` entry (default 64000). |
 | `debug` | boolean | Enable the debug log. |
-
-Unlike the opencode port, `reasoning` / `noReasoning` may reference **any** family
-(Claude or GPT) — cross‑family routing is supported.
 
 ## Debugging
 
@@ -132,7 +126,7 @@ tail -f ~/.local/state/github-copilot-auto/plugin.log
 | `chat.message` (capture prompt) | last user message read from `Context.messages` in `streamSimple` |
 | `chat.params` (override model id) | `streamSimple` picks the model and delegates to its native stream |
 | `chat.headers` (session token) | `options.headers["Copilot-Session-Token"]` passed to the inner stream |
-| `session.compacted` (invalidate) | `pi.on("session_compact", …)` clears the routing cache |
+| `session.compacted` (invalidate) | `pi.on("session_compact", …)` clears only the compacted conversation cache |
 
 Token exchange and the Copilot request construction (endpoint paths, `X-Initiator`,
 vision headers, Bearer auth) reuse pi's built‑in `github-copilot` provider logic —
