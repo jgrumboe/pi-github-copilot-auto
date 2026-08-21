@@ -1,7 +1,7 @@
 {
   "name": "pi-github-copilot-auto",
-  "version": "0.1.1",
-  "description": "Adds a github-copilot-auto/auto model to pi that follows GitHub Copilot's server-side auto model selection (intent router).",
+  "version": "0.2.0",
+  "description": "Adds github-copilot-auto/auto models to pi that follow GitHub Copilot's server-side auto model selection via the single-call AutoV2 router (POST /auto), with routing-tier support.",
   "keywords": [
     "pi-package",
     "pi-extension",
