@@ -1,11 +1,12 @@
 {
   "name": "pi-github-copilot-auto",
-  "version": "0.2.0",
-  "description": "Adds github-copilot-auto/auto models to pi that follow GitHub Copilot's server-side auto model selection via the single-call AutoV2 router (POST /auto), with routing-tier support.",
+  "version": "0.3.0",
+  "description": "Adds separate GitHub Copilot Auto and opt-in Fusion Standard models to pi, using Copilot's server-side POST /auto router.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "github-copilot",
+    "copilot-fusion",
     "copilot",
     "ai"
   ],
@@ -13,6 +14,7 @@
   "type": "module",
   "files": [
     "index.ts",
+    "auto-identity.ts",
     ".npmrc",
     "README.md",
     "LICENSE",
@@ -30,6 +32,19 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:current": "vitest run --config vitest.current.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.74.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "^22.19.0",
+    "pi-ai-current": "npm:@earendil-works/pi-ai@0.85.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
