@@ -210,8 +210,12 @@ used):
    plan's token and effort: the latest request (without earlier conversation),
    a compact record of the draft's tool activity and the draft answer, asking
    for a JSON verdict (`accept`/`revise`, score, feedback). An unusable verdict
-   keeps the draft. The review is skipped when no fix could follow (no
-   interactive UI, or fixes declined for the session).
+   keeps the draft. Press **Escape** during review to cancel it and keep the
+   draft. The review is skipped in RPC and non-interactive modes, when terminal
+   input is unavailable, or when fixes were declined for the session. Pi 1.5.1
+   does not expose a live abort signal to extensions at this boundary, so an
+   external or programmatic abort may not cancel an in-progress TUI review; it
+   is limited to 180 seconds.
 3. **Fix** — if the reviewer asks for changes, pi shows a dialog with the
    feedback: run the plan's `repair`/`revision` step (additional cost), keep the
    draft, or always/never do so for the rest of the session (per Fusion level,
@@ -219,19 +223,25 @@ used):
    framed as automated reviewer output that ranks below the original request,
    capped at 2,000 characters — and pi continues **once** on the fix model; the
    revised answer appears below the draft and its tool calls go through pi as
-   usual.
+   usual. If a renewed plan changes the approved fix model, role, or effort,
+   the fix is stopped instead of running the unapproved step.
 
 The footer shows the outcome (`accepted by gpt-6-luna`, `repair after review`,
 `gpt-6-luna suggested changes; draft kept`, `review skipped, draft kept`,
 `review unavailable, draft kept`). Plans whose later steps have unknown roles
-run the draft and report `review unavailable`. The review and fix stages use
+run the draft and report `review unavailable`; unexpected role order also
+falls back to the draft. The review and fix stages use
 pi's `agent_before_settle` boundary; on pi versions without it, multi-step plans
 run the draft only. The draft's tool effects are real before the review (there
 is no staging of writes), and how GitHub bills these turns has not been
 verified. In a handful of sampled prompts, Max mostly returned `solo` plans and
 High returned multi-step plans for several coding/debugging prompts.
 
-**Cost:** plans can select very expensive configurations (e.g. Max picked
+**Cost and accounting:** review calls are separate and **not included in pi's
+session token or cost totals**. After a successful review, a notification shows
+its input, output, cache-read and cache-write token counts; failed or cancelled
+reviews may incur unreported partial usage. These counts do not establish how
+GitHub bills them. Plans can select very expensive configurations (e.g. Max picked
 `claude-opus-5.5` at `max` effort; one such native turn reported about 17.5 AIU
 and 15 premium-request units). Summaries never run at a plan's effort: pi's
 compaction/branch summaries use a one-off Fusion Standard route when Standard is

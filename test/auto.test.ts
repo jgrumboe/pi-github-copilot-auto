@@ -189,6 +189,34 @@ afterEach(() => {
 	tempDirs = [];
 });
 
+describe("Auto router cancellation", () => {
+	it.each(["timeout", "caller abort"])("aborts a stalled response body on %s", async (reason) => {
+		const ext = await loadExtension();
+		const originalFetch = fetchMock.getMockImplementation()! as (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+		let started!: () => void;
+		const bodyStarted = new Promise<void>(resolve => { started = resolve; });
+		fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (String(input).endsWith("/auto")) {
+				const body = new ReadableStream({ start(controller) {
+					started();
+					init?.signal?.addEventListener("abort", () => controller.error(new Error("aborted")), { once: true });
+				} });
+				return new Response(body, { status: 200 });
+			}
+			return originalFetch(input, init);
+		});
+		const ac = new AbortController();
+		if (reason === "timeout") vi.useFakeTimers();
+		try {
+			const result = collect(ext.stream(ext.model(), prompt, { sessionId: `body-${reason}`, signal: ac.signal }));
+			await bodyStarted;
+			if (reason === "timeout") await vi.advanceTimersByTimeAsync(5001);
+			else ac.abort();
+			expect(finalMessage(await result).stopReason).toBe("error");
+		} finally { vi.useRealTimers(); }
+	});
+});
+
 describe("Fusion Standard entitlement discovery", () => {
 	it("checks /meta before advertising Standard, without routing or generating", async () => {
 		const ext = await loadExtension();
@@ -627,6 +655,20 @@ describe("Real user-turn identity", () => {
 		expect(chatTokens()).toEqual(["test-auto-token-1", "test-auto-token-1", "test-auto-token-1"]);
 	});
 
+	it("keeps Standard turn identity after split compaction without misclassifying standalone summaries", async () => {
+		autoHook = () => modelCards;
+		const ext = await loadExtension();
+		const real = user("original task", 10);
+		await ext.handlers.get("context")!({ type: "context", messages: [real] }, ctxFor("split-standard"));
+		const assistant = finalMessage(await collect(ext.fusionStream(ext.fusionModel(), { messages: [real] }, { sessionId: "split-standard" })));
+		const summary = { role: "compactionSummary", summary: "older content", timestamp: 30 };
+		await ext.handlers.get("context")!({ type: "context", messages: [summary, assistant] }, ctxFor("split-standard"));
+		await collect(ext.fusionStream(ext.fusionModel(), { messages: [user("summary", 30), assistant] }, { sessionId: "split-standard" }));
+		await collect(ext.fusionStream(ext.fusionModel(), { messages: [user("standalone summary", 50)] }, { sessionId: "split-standard" }));
+		expect(autoBodies()).toHaveLength(1);
+		expect(chatTokens()).toEqual(["test-auto-token-1", "test-auto-token-1", "test-auto-token-1"]);
+	});
+
 	it("an auxiliary request without a route makes a one-off anchor that is not stored", async () => {
 		const ext = await loadExtension();
 		await ext.handlers.get("context")!({ type: "context", messages: [user("real", 10)] }, ctxFor("aux-cold"));
@@ -1007,7 +1049,7 @@ describe("Fusion High and Max (server-authored plans)", () => {
 		function settle(ext: Awaited<ReturnType<typeof loadExtension>>, sessionId: string, messages: Context["messages"], ui: any, extra: object = {}) {
 			return ext.handlers.get("agent_before_settle")!(
 				{ type: "agent_before_settle", outcome: "completed", entries: [], continue: false, context: { contextMessages: messages, canContinue: true }, ...extra },
-				{ sessionManager: { getSessionId: () => sessionId }, ui, hasUI: true },
+				{ sessionManager: { getSessionId: () => sessionId }, ui: { onTerminalInput: () => () => {}, ...ui }, hasUI: true, mode: "tui" },
 			);
 		}
 
@@ -1084,7 +1126,7 @@ describe("Fusion High and Max (server-authored plans)", () => {
 			const messages = await draftTurn(ext, "rev-keep");
 			const result = await ext.handlers.get("agent_before_settle")!(
 				{ outcome: "completed", entries: [], context: { contextMessages: messages, canContinue: true } },
-				{ sessionManager: { getSessionId: () => "rev-keep" }, ui: { ...ui, setStatus: vi.fn() }, hasUI },
+				{ sessionManager: { getSessionId: () => "rev-keep" }, ui: { onTerminalInput: () => () => {}, ...ui, setStatus: vi.fn() }, hasUI, mode: "tui" },
 			);
 			expect(result).toBeUndefined();
 			expect(reviews()).toHaveLength(1);
@@ -1105,6 +1147,59 @@ describe("Fusion High and Max (server-authored plans)", () => {
 			);
 			expect(result).toBeUndefined();
 			expect(reviews()).toHaveLength(0);
+		});
+
+		it("skips paid review in RPC because pi does not expose boundary abort", async () => {
+			metaResponse = plannedMeta(); planHook = () => cascadePlan;
+			const ext = await loadExtension();
+			const messages = await draftTurn(ext, "rev-rpc");
+			const select = vi.fn();
+			const result = await ext.handlers.get("agent_before_settle")!(
+				{ outcome: "completed", entries: [], context: { contextMessages: messages } },
+				{ sessionManager: { getSessionId: () => "rev-rpc" }, ui: { select }, hasUI: true, mode: "rpc" },
+			);
+			expect(result).toBeUndefined();
+			expect(reviews()).toHaveLength(0);
+			expect(select).not.toHaveBeenCalled();
+		});
+
+		it.each(["\x1b", "\x1b[27u", "\x1b[27;1:1u", "\x1b[27;1;27~"])("cancels the reviewer on Escape encoding %j and does not prompt", async (escape) => {
+			metaResponse = plannedMeta(); planHook = () => cascadePlan;
+			const ext = await loadExtension();
+			const messages = await draftTurn(ext, "rev-escape");
+			const originalFetch = fetchMock.getMockImplementation()! as (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+			let started!: () => void;
+			const requestStarted = new Promise<void>(resolve => { started = resolve; });
+			fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+				if (typeof init?.body === "string" && init.body.includes("You review the work of another AI")) {
+					started();
+					return new Promise<Response>((_resolve, reject) => {
+						if (init.signal?.aborted) reject(new Error("aborted"));
+						else init.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+					});
+				}
+				return originalFetch(input, init);
+			});
+			let input!: (data: string) => unknown;
+			const cleanup = vi.fn();
+			const select = vi.fn();
+			const pending = settle(ext, "rev-escape", messages, { select, onTerminalInput: (handler: typeof input) => { input = handler; return cleanup; } });
+			await requestStarted;
+			expect(input(escape)).toEqual({ consume: true });
+			expect(await pending).toBeUndefined();
+			expect(cleanup).toHaveBeenCalledOnce();
+			expect(select).not.toHaveBeenCalled();
+		});
+
+		it("surfaces reviewer token usage outside pi session totals", async () => {
+			metaResponse = plannedMeta(); planHook = () => cascadePlan;
+			replyHook = verdict({ verdict: "accept", feedback: "" });
+			const ext = await loadExtension();
+			const messages = await draftTurn(ext, "rev-usage");
+			const notify = vi.fn();
+			await settle(ext, "rev-usage", messages, { select: vi.fn(), notify });
+			expect(notify).toHaveBeenCalledWith(expect.stringContaining("11 input, 3 output"), "info");
+			expect(notify).toHaveBeenCalledWith(expect.stringContaining("Excluded from pi session totals"), "info");
 		});
 
 		it("'never' skips later reviews in the session", async () => {
@@ -1193,6 +1288,59 @@ describe("Fusion High and Max (server-authored plans)", () => {
 			expect(planBodies()).toHaveLength(2);
 			expect(chats().at(-1)!.body.model).toBe("gpt-5.3-codex-repair");
 			expect(chats().at(-1)!.headers.get("Copilot-Session-Token")).toBe("test-plan-token-2");
+		});
+
+		it.each(["model", "effort", "solo", "unknown"]) ("rejects a renewed plan whose approved fix changed: %s", async (change) => {
+			metaResponse = plannedMeta();
+			planHook = (_body, n) => n === 1 ? cascadePlan : change === "solo"
+				? { fusion_pattern: "solo", steps: [{ role: "generation", model_id: "gpt-6-luna" }] }
+				: { ...cascadePlan, steps: change === "unknown" ? [...cascadePlan.steps, { role: "extra", model_id: "gpt-6-luna" }] : cascadePlan.steps.map((s, i) => i !== 2 ? s : { ...s, ...(change === "model" ? { model_id: "gpt-6-luna" } : { reasoning_effort: "high" }) }) };
+			replyHook = verdict({ verdict: "revise", feedback: "wrong" });
+			const ext = await loadExtension();
+			const messages = await draftTurn(ext, `changed-${change}`);
+			const result: any = await settle(ext, `changed-${change}`, messages, { select: async (_t: string, o: string[]) => o[0] });
+			vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3600_000);
+			const custom = { role: "custom", content: result.entries[0].content, timestamp: 30 } as any;
+			await ext.handlers.get("context")!({ type: "context", messages: [...messages, custom] }, ctxFor(`changed-${change}`));
+			const before = chats().length;
+			const failed = finalMessage(await collect(ext.fusionStream(ext.fusionModel("high"), { messages: [...messages, user(custom.content, 30)] }, { sessionId: `changed-${change}` })));
+			expect(failed.stopReason).toBe("error");
+			expect(failed.errorMessage).toContain("changed the approved fix");
+			expect(chats()).toHaveLength(before);
+		});
+
+		it("runs only the draft for a plan containing an unknown later role", async () => {
+			metaResponse = plannedMeta();
+			planHook = () => ({ ...cascadePlan, steps: [cascadePlan.steps[0], cascadePlan.steps[1], { role: "unknown", model_id: "gpt-6-luna" }, cascadePlan.steps[2]] });
+			const ext = await loadExtension();
+			const messages = await draftTurn(ext, "unknown-role");
+			const status = vi.fn();
+			await settle(ext, "unknown-role", messages, { select: vi.fn(), setStatus: status });
+			expect(reviews()).toHaveLength(0);
+			expect(status).toHaveBeenLastCalledWith("copilot-fusion", expect.stringContaining("review unavailable"));
+		});
+
+		it("retains draft and fix routing across split-turn compaction", async () => {
+			metaResponse = plannedMeta();
+			planHook = () => cascadePlan;
+			replyHook = verdict({ verdict: "revise", feedback: "wrong" });
+			const ext = await loadExtension();
+			const original = await draftTurn(ext, "split-turn");
+			const retained = original[1];
+			const summary = { role: "compactionSummary", summary: "previous turn", timestamp: 20 } as any;
+			await ext.handlers.get("context")!({ type: "context", messages: [summary, retained] }, ctxFor("split-turn"));
+			const projected = [user("summary of previous turn", 20), retained];
+			const resumed = finalMessage(await collect(ext.fusionStream(ext.fusionModel("high"), { messages: projected }, { sessionId: "split-turn" })));
+			expect(chats().at(-1)!.body.model).toBe("gpt-5.3-codex");
+			expect(planBodies()).toHaveLength(1);
+			const result: any = await settle(ext, "split-turn", [summary, retained, resumed], { select: async (_t: string, o: string[]) => o[0] });
+			expect(result).toMatchObject({ continue: true });
+			expect(JSON.stringify(reviews()[0].body)).toContain("fix ring buffer");
+			const custom = { role: "custom", content: result.entries[0].content, timestamp: 30 } as any;
+			await ext.handlers.get("context")!({ type: "context", messages: [summary, retained, resumed, custom] }, ctxFor("split-turn"));
+			await collect(ext.fusionStream(ext.fusionModel("high"), { messages: [...projected, resumed, user(custom.content, 30)] }, { sessionId: "split-turn" }));
+			expect(chats().at(-1)!.body.model).toBe("gpt-5.3-codex-repair");
+			expect(planBodies()).toHaveLength(1);
 		});
 
 		it("caps the feedback, marks truncation, and frames it as reviewer output", async () => {
