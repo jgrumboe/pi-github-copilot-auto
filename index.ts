@@ -60,6 +60,7 @@ import {
 	streamSimpleAnthropic,
 	streamSimpleOpenAICompletions,
 	streamSimpleOpenAIResponses,
+	type Usage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { asAutoEvent, asFusionEvent, restoreAutoContext, restoreFusionContext } from "./auto-identity.js";
@@ -443,7 +444,7 @@ async function fetchAutoDecision(
 	baseUrl: string,
 	token: string,
 	prompt: string,
-	opts: { tier: AutoModeTier; hasImage?: boolean; fusion?: boolean; multiTurn?: Record<string, unknown> },
+	opts: { tier: AutoModeTier; hasImage?: boolean; fusion?: boolean; multiTurn?: Record<string, unknown>; signal?: AbortSignal },
 ): Promise<AutoDecision | undefined> {
 	const body: Record<string, unknown> = { prompt };
 	// `fast` is a server default; only send an explicit tier for the rest so the
@@ -458,28 +459,29 @@ async function fetchAutoDecision(
 
 	const ac = new AbortController();
 	const timer = setTimeout(() => ac.abort(), AUTO_TIMEOUT_MS);
-	let res: Response | undefined;
+	const abort = () => ac.abort();
+	if (opts.signal?.aborted) ac.abort();
+	else opts.signal?.addEventListener("abort", abort, { once: true });
+	let data: { session_token?: string; selected_model?: AutoSelectedModel; expires_at?: number; hydra_scores?: Record<string, number>; [key: string]: unknown } | undefined;
 	try {
-		res = await fetch(`${baseUrl}/auto`, {
+		const res = await fetch(`${baseUrl}/auto`, {
 			method: "POST",
 			headers: capiHeaders(token),
 			body: JSON.stringify(body),
 			signal: ac.signal,
 		});
+		if (!res.ok) {
+			log(`auto fetch non-ok: ${res.status}`);
+			return undefined;
+		}
+		data = await res.json() as typeof data;
 	} catch (e) {
-		log(`auto fetch failed: ${String(e)}`);
+		log(`auto fetch failed: ${e instanceof Error ? e.name : "error"}`);
 		return undefined;
 	} finally {
 		clearTimeout(timer);
+		opts.signal?.removeEventListener("abort", abort);
 	}
-	if (!res || !res.ok) {
-		// Status only: authenticated response bodies are never logged.
-		log(`auto fetch non-ok: ${res?.status}`);
-		return undefined;
-	}
-	const data = (await res.json().catch(() => undefined)) as
-		| { session_token?: string; selected_model?: AutoSelectedModel; expires_at?: number; hydra_scores?: Record<string, number>; [key: string]: unknown }
-		| undefined;
 	if (!data || typeof data.session_token !== "string" || !data.session_token.trim() || !data.selected_model?.id) {
 		// Do not log the payload: even a malformed response can contain a token.
 		log("auto response missing session_token or selected_model");
@@ -618,6 +620,9 @@ const realUserTurns = new Map<string, Set<string>>();
  * them, as the native client does. Memory only; capped; never logged.
  */
 const realUserLog = new Map<string, { key: string; text: string }[]>();
+// A split-turn projection can omit the typed request while retaining an assistant
+// message. Match that actual projection, not a standalone summarizer request.
+const splitTurnProjection = new Map<string, { turn: { key: string; text: string }; assistantTimestamp: number; assistantModel: string; assistantProvider: string }>();
 const USER_LOG_MAX = 64;
 
 function recordUserLog(sessionId: string, entries: { key: string; text: string }[]): void {
@@ -689,8 +694,11 @@ function resolveUserTurn(context: Context, sessionId: string | undefined): UserT
 		if (matched.length) turns = matched;
 		else if (users.length) auxiliary = true;
 	}
+	const split = sessionId ? splitTurnProjection.get(sessionId) : undefined;
+	const matchesSplit = split && context.messages.some((m) => m.role === "assistant" && m.timestamp === split.assistantTimestamp && m.model === split.assistantModel && m.provider === split.assistantProvider);
+	if (matchesSplit) auxiliary = false;
 	const last = turns.at(-1);
-	const key = last ? userTurnId(last.timestamp, last.text) : "";
+	const key = matchesSplit ? split.turn.key : last ? userTurnId(last.timestamp, last.text) : "";
 	const identified = !!real && !auxiliary;
 	const contextEntries = turns.map((u) => ({ key: userTurnId(u.timestamp, u.text), text: u.text }));
 	// Prefer the session log (survives compaction) when it reaches the current turn.
@@ -698,7 +706,7 @@ function resolveUserTurn(context: Context, sessionId: string | undefined): UserT
 	const at = logged ? logged.findIndex((e) => e.key === key) : -1;
 	return {
 		key,
-		prompt: last?.text ?? "",
+		prompt: matchesSplit ? split.turn.text : last?.text ?? "",
 		entries: logged && at >= 0 ? logged.slice(0, at + 1) : contextEntries,
 		auxiliary,
 		identified,
@@ -735,6 +743,7 @@ async function routeFusionTurn(
 	token: string,
 	turn: UserTurn,
 	hasImage: boolean,
+	signal?: AbortSignal,
 ): Promise<{ decision: AutoDecision; cadence: FusionCadence; note: string } | undefined> {
 	const turnsWord = (n: number) => `${n} turn${n === 1 ? "" : "s"}`;
 	const anchor = conv.decision;
@@ -751,6 +760,7 @@ async function routeFusionTurn(
 		const drift = await fetchAutoDecision(baseUrl, token, driftPrompt(turn, controls, prior.historyStartKey), {
 			tier: FUSION_TIER,
 			hasImage,
+			signal,
 			fusion: true,
 			multiTurn: {
 				routing_intent: "drift_check",
@@ -784,7 +794,7 @@ async function routeFusionTurn(
 		};
 	}
 	const fresh = await fetchAutoDecision(baseUrl, token, turn.prompt, {
-		tier: FUSION_TIER, hasImage, fusion: true, multiTurn: { ...ANCHOR_INTENT },
+		tier: FUSION_TIER, hasImage, signal, fusion: true, multiTurn: { ...ANCHOR_INTENT },
 	});
 	return fresh ? { decision: fresh, cadence: anchorCadence(fresh), note: fresh.driftControls ? "anchor" : "anchor each turn" } : undefined;
 }
@@ -804,6 +814,7 @@ async function ensureDecision(
 	tier: AutoModeTier,
 	hasImage: boolean,
 	fusion: boolean,
+	signal?: AbortSignal,
 ): Promise<AutoDecision | undefined> {
 	const fresh = conv.decision && Date.now() < conv.decision.expiresAtMs - SESSION_REFRESH_SKEW_MS;
 	const sameRoute = conv.routedTier === tier && conv.routedFusion === fusion && (!fusion || conv.routedTurnKey === turn.key);
@@ -811,18 +822,18 @@ async function ensureDecision(
 	if (conv.decisionInflight) {
 		await conv.decisionInflight;
 		// A concurrent caller might have routed another tier; check again.
-		return ensureDecision(conv, baseUrl, token, turn, tier, hasImage, fusion);
+		return ensureDecision(conv, baseUrl, token, turn, tier, hasImage, fusion, signal);
 	}
 
 	conv.decisionInflight = (async () => {
 		if (fusion) {
-			const routed = await routeFusionTurn(conv, baseUrl, token, turn, hasImage);
+			const routed = await routeFusionTurn(conv, baseUrl, token, turn, hasImage, signal);
 			if (!routed) return undefined;
 			conv.decision = routed.decision;
 			conv.fusion = routed.cadence;
 			conv.fusionNote = routed.note;
 		} else {
-			const d = await fetchAutoDecision(baseUrl, token, turn.prompt, { tier, hasImage });
+			const d = await fetchAutoDecision(baseUrl, token, turn.prompt, { tier, hasImage, signal });
 			// Never reuse an expired or differently-tiered token when re-routing fails.
 			if (!d) return undefined;
 			conv.decision = d;
@@ -1005,9 +1016,9 @@ function streamRouted(model: Model<Api>, context: Context, options: SimpleStream
 			if (fusion && (turn.auxiliary || ephemeral)) {
 				decision = compatible
 					? conv.decision
-					: await fetchAutoDecision(auth.baseUrl, auth.token, prompt, { tier, hasImage, fusion: true, multiTurn: { ...ANCHOR_INTENT } });
+					: await fetchAutoDecision(auth.baseUrl, auth.token, prompt, { tier, hasImage, signal: options?.signal, fusion: true, multiTurn: { ...ANCHOR_INTENT } });
 			} else if (prompt && !(fusion && compatible)) {
-				decision = await ensureDecision(conv, auth.baseUrl, auth.token, { ...turn, prompt }, tier, hasImage, fusion);
+				decision = await ensureDecision(conv, auth.baseUrl, auth.token, { ...turn, prompt }, tier, hasImage, fusion, options?.signal);
 			} else {
 				decision = conv.decision;
 			}
@@ -1195,15 +1206,11 @@ function stepToExecute(plan: FusionPlan): { step: FusionPlanStep; effort: string
 	return { step, effort: step.effort ?? DEFAULT_STEP_EFFORT, multiStep: plan.steps.length > 1 };
 }
 
-const REVIEW_ROLES = new Set(["escalation", "critic"]);
-const FIX_ROLES = new Set(["repair", "revision"]);
-
 /** Review and fix steps of a multi-step plan, by role (observed: escalation/repair, critic/revision). */
 function reviewSteps(plan: FusionPlan): { review?: FusionPlanStep; fix?: FusionPlanStep } {
-	return {
-		review: plan.steps.find((s, i) => i > 0 && REVIEW_ROLES.has(s.role)),
-		fix: plan.steps.find((s, i) => i > 0 && FIX_ROLES.has(s.role)),
-	};
+	const expected = plan.pattern === "cascade" ? ["draft", "escalation", "repair"] : plan.pattern === "critique" ? ["draft", "critic", "revision"] : [];
+	if (plan.steps.length < 2 || plan.steps.length > expected.length || plan.steps.some((step, i) => step.role !== expected[i])) return {};
+	return { review: plan.steps[1], fix: plan.steps[2] };
 }
 
 async function ensurePlan(conv: PlanConvState, baseUrl: string, token: string, turn: UserTurn, mode: string, signal?: AbortSignal): Promise<FusionPlan | undefined> {
@@ -1286,7 +1293,7 @@ function streamPlannedFusion(model: Model<Api>, context: Context, options: Simpl
 				const prompt = turn.prompt.slice(-AUX_PROMPT_MAX_CHARS);
 				if (fusionAvailability.standard && prompt) {
 					const decision = await fetchAutoDecision(auth.baseUrl, auth.token, prompt, {
-						tier: FUSION_TIER, hasImage: hasImageInput(context), fusion: true, multiTurn: { ...ANCHOR_INTENT },
+						tier: FUSION_TIER, hasImage: hasImageInput(context), signal: options?.signal, fusion: true, multiTurn: { ...ANCHOR_INTENT },
 					});
 					if (!decision) {
 						await fail("Failed to route a GitHub Copilot Fusion summary request (POST /auto).");
@@ -1331,9 +1338,14 @@ function streamPlannedFusion(model: Model<Api>, context: Context, options: Simpl
 			}
 			const draft = stepToExecute(plan);
 			const fixing = conv.review?.turnKey === turn.key && conv.review.stage === "fixing";
-			// Model and token always come from the same (current) plan, also after a
-			// same-turn re-plan: its fix step, otherwise its first step.
-			const fixStep = fixing ? reviewSteps(plan).fix ?? plan.steps[0] : undefined;
+			const fixStep = fixing ? reviewSteps(plan).fix : undefined;
+			const approved = fixing ? reviewSteps(conv.review!.plan).fix : undefined;
+			if (fixing && (!fixStep || !approved || fixStep.role !== approved.role || fixStep.modelId !== approved.modelId || (fixStep.effort ?? DEFAULT_STEP_EFFORT) !== (approved.effort ?? DEFAULT_STEP_EFFORT))) {
+				conv.review!.stage = "done";
+				await fail("Copilot Fusion's renewed plan changed the approved fix; the fix was stopped. Prior draft or fix tool actions were not rolled back.");
+				out.end();
+				return;
+			}
 			const step = fixStep ?? draft.step;
 			const effort = fixStep ? fixStep.effort ?? DEFAULT_STEP_EFFORT : draft.effort;
 			if (plan !== previousPlan) {
@@ -1431,12 +1443,12 @@ function parseVerdict(text: string): ReviewVerdict | undefined {
 }
 
 /** The current turn's request, the draft's tool activity and its final answer. */
-function reviewMaterial(messages: unknown[]): { request: string; activity: string; answer: string } | undefined {
+function reviewMaterial(messages: unknown[], splitRequest?: string): { request: string; activity: string; answer: string } | undefined {
 	const msgs = messages as Array<{ role?: string; content?: any; toolName?: string; isError?: boolean }>;
 	let userIndex = -1;
 	for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i]?.role === "user") { userIndex = i; break; }
-	if (userIndex < 0) return undefined;
-	const request = messageText(msgs[userIndex].content ?? "");
+	if (userIndex < 0 && !splitRequest) return undefined;
+	const request = userIndex < 0 ? splitRequest! : messageText(msgs[userIndex].content ?? "");
 	const activity: string[] = [];
 	let answer = "";
 	for (const m of msgs.slice(userIndex + 1)) {
@@ -1459,22 +1471,23 @@ function reviewMaterial(messages: unknown[]): { request: string; activity: strin
 }
 
 /** Runs one tool-less request on a plan step and returns its text. */
-async function completeOnStep(step: FusionPlanStep, baseUrl: string, token: string, sessionToken: string, systemPrompt: string, user: string): Promise<string | undefined> {
+async function completeOnStep(step: FusionPlanStep, baseUrl: string, token: string, sessionToken: string, systemPrompt: string, user: string, signal: AbortSignal): Promise<{ text: string; usage: Usage } | undefined> {
 	const context: Context = { systemPrompt, messages: [{ role: "user", content: user, timestamp: Date.now() }] };
-	let text: string | undefined;
-	const options: SimpleStreamOptions = { maxRetries: 1, signal: AbortSignal.timeout(REVIEW_TIMEOUT_MS) };
+	let result: { text: string; usage: Usage } | undefined;
+	const options: SimpleStreamOptions = { maxRetries: 1, signal };
 	for await (const event of delegateStream(planTarget(step, baseUrl), context, options, token, sessionToken, true, step.effort ?? DEFAULT_STEP_EFFORT)) {
 		if (event.type === "done") {
-			text = event.message.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("\n");
+			const text = event.message.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("\n");
 			const u = event.message.usage;
+			result = { text, usage: u };
 			log(`fusion review reply: model=${step.modelId} stop=${event.message.stopReason} textLen=${text.length} tokens=in:${u?.input ?? 0}+cache:${u?.cacheRead ?? 0},out:${u?.output ?? 0}`);
 		}
 		if (event.type === "error") {
-			text = undefined;
+			result = undefined;
 			log(`fusion review request failed (${event.error.stopReason})`);
 		}
 	}
-	return text;
+	return result;
 }
 
 /** Per-session answer to "run the costly fix step?" ("always" / "never"). */
@@ -1482,6 +1495,7 @@ const fixPreference = new Map<string, "always" | "never">();
 
 type SettleUi = {
 	select?: (title: string, options: string[]) => Promise<string | undefined>;
+	onTerminalInput?: (handler: (data: string) => { consume?: boolean } | undefined) => () => void;
 	setStatus?: (key: string, text: string) => void;
 	notify?: (message: string, variant: "info" | "success" | "warning" | "error") => void;
 };
@@ -1501,7 +1515,7 @@ async function confirmFix(prefKey: string, ui: SettleUi | undefined, hasUI: bool
 
 type SettleEvent = { outcome?: string; entries?: unknown[]; context?: { contextMessages?: unknown[]; canContinue?: boolean } };
 
-async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: SettleUi | undefined, hasUI: boolean): Promise<{ entries: unknown[]; continue: true } | undefined> {
+async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: SettleUi | undefined, hasUI: boolean, mode: string | undefined, hostSignal?: AbortSignal): Promise<{ entries: unknown[]; continue: true } | undefined> {
 	const messages = (event.context?.contextMessages ?? []) as Array<{ role?: string; content?: any; timestamp?: number; provider?: string; model?: string }>;
 	let lastUser: (typeof messages)[number] | undefined;
 	let lastAssistant: (typeof messages)[number] | undefined;
@@ -1509,7 +1523,9 @@ async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: Settl
 		if (!lastUser && messages[i]?.role === "user") lastUser = messages[i];
 		if (!lastAssistant && messages[i]?.role === "assistant") lastAssistant = messages[i];
 	}
-	const runTurnKey = lastUser ? userTurnId(lastUser.timestamp ?? 0, messageText(lastUser.content ?? "")) : undefined;
+	const split = splitTurnProjection.get(sessionId);
+	const matchesSplit = !lastUser && split && messages.some((m) => m.role === "assistant" && m.timestamp === split.assistantTimestamp && m.model === split.assistantModel && m.provider === split.assistantProvider);
+	const runTurnKey = matchesSplit ? split.turn.key : lastUser ? userTurnId(lastUser.timestamp ?? 0, messageText(lastUser.content ?? "")) : undefined;
 	let result: { entries: unknown[]; continue: true } | undefined;
 	for (const level of Object.keys(FUSION_MODES) as PlannedFusionLevel[]) {
 		const conv = planConversations.get(planConvKey(sessionId, level));
@@ -1534,19 +1550,19 @@ async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: Settl
 		const status = (note: string, model = draftStep.modelId) => ui?.setStatus?.("copilot-fusion", `fusion:${level} \u2192 ${model} (${plan.pattern}: ${note})`);
 		const prefKey = `${sessionId}#${level}`;
 		// Do not pay for a review that cannot lead to a fix.
-		if (fixPreference.get(prefKey) === "never" || (!fixPreference.has(prefKey) && (!hasUI || !ui?.select))) {
+		if (fixPreference.get(prefKey) === "never" || !hasUI || !ui?.select || mode !== "tui" || !ui.onTerminalInput) {
 			status("review skipped, draft kept");
-			log(`fusion ${level}: review skipped (no way to confirm a fix, or fixes declined for the session)`);
+			log(`fusion ${level}: review skipped (no cancellable TUI confirmation, or fixes declined for the session)`);
 			continue;
 		}
-		const material = reviewMaterial(messages);
+		const material = reviewMaterial(messages, matchesSplit ? split.turn.text : undefined);
 		const auth = await ensureToken();
 		if (event.outcome !== "completed" || !review || !material || !auth || Date.now() >= plan.expiresAtMs - SESSION_REFRESH_SKEW_MS) {
 			status("review unavailable, draft kept");
 			log(`fusion ${level}: review skipped (outcome=${event.outcome ?? "?"}, reviewer=${review?.modelId ?? "-"})`);
 			continue;
 		}
-		status(`reviewing with ${review.modelId}`);
+		status(`reviewing with ${review.modelId}; Esc cancels`);
 		const prompt = [
 			REVIEW_FOCUS[plan.pattern] ?? REVIEW_FOCUS.cascade,
 			`## Request\n${material.request}`,
@@ -1554,7 +1570,37 @@ async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: Settl
 			`## Final answer\n${material.answer}`,
 			'Reply now with exactly one JSON object of this form and nothing else: {"verdict": "accept" | "revise", "score": <integer 1-5>, "feedback": "<specific problems and how to fix them; empty when accepting>"}',
 		].join("\n\n");
-		const verdict = parseVerdict((await completeOnStep(review, auth.baseUrl, auth.token, plan.sessionToken, REVIEW_SYSTEM_PROMPT, prompt)) ?? "");
+		// Pi 1.5 has no active settle-boundary abort signal. In the TUI, capture
+		// Escape locally; RPC is skipped because its abort command is not exposed.
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), REVIEW_TIMEOUT_MS);
+		const hostAbort = () => controller.abort();
+		if (hostSignal?.aborted) controller.abort();
+		else hostSignal?.addEventListener("abort", hostAbort, { once: true });
+		const unsubscribe = ui.onTerminalInput((data) => {
+			// Legacy, Kitty and modifyOtherKeys encodings of an unmodified Escape press.
+			if (data === "\x1b" || /^\x1b\[27(?:;1(?::[12])?)?u$/.test(data) || data === "\x1b[27;1;27~") { controller.abort(); return { consume: true }; }
+			if (data === "\x03") controller.abort();
+			return undefined;
+		});
+		let response: Awaited<ReturnType<typeof completeOnStep>>;
+		try {
+			response = await completeOnStep(review, auth.baseUrl, auth.token, plan.sessionToken, REVIEW_SYSTEM_PROMPT, prompt, controller.signal);
+		} finally {
+			unsubscribe();
+			clearTimeout(timeout);
+			hostSignal?.removeEventListener("abort", hostAbort);
+		}
+		if (controller.signal.aborted) {
+			status("review cancelled, draft kept");
+			ui.notify?.(`Copilot Fusion ${levelName(level)} review cancelled; partial usage may not be included in pi totals.`, "info");
+			continue;
+		}
+		if (response) {
+			const u = response.usage;
+			ui.notify?.(`Copilot Fusion ${levelName(level)} review usage: ${u.input} input, ${u.output} output, ${u.cacheRead} cache-read, ${u.cacheWrite} cache-write tokens. Excluded from pi session totals; billing unverified.`, "info");
+		} else ui.notify?.(`Copilot Fusion ${levelName(level)} review failed; partial usage may be excluded from pi session totals.`, "info");
+		const verdict = parseVerdict(response?.text ?? "");
 		if (!verdict) {
 			status("review unparseable, draft kept");
 			log(`fusion ${level}: review by ${review.modelId} returned no usable verdict; draft kept`);
@@ -1727,6 +1773,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			});
 		realUserTurns.set(key, new Set(entries.map((e) => e.key)));
 		recordUserLog(key, entries);
+		const lastLogged = realUserLog.get(key)?.at(-1);
+		const assistant = [...event.messages].reverse().find((m) => m.role === "assistant");
+		if (lastLogged && !entries.some((e) => e.key === lastLogged.key) && assistant?.role === "assistant") {
+			splitTurnProjection.set(key, { turn: lastLogged, assistantTimestamp: assistant.timestamp, assistantModel: assistant.model, assistantProvider: assistant.provider });
+		} else splitTurnProjection.delete(key);
 	});
 
 	// Multi-step Fusion plans: review the finished draft and optionally run the
@@ -1737,14 +1788,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		async (event, ctx) => {
 			const key = ctx?.sessionManager?.getSessionId?.();
 			if (!key) return undefined;
-			return reviewFusionTurn(event, key, ctx.ui, ctx.hasUI !== false);
+			return reviewFusionTurn(event, key, ctx.ui, ctx.hasUI !== false, ctx.mode, ctx.signal);
 		},
 	);
 
 	// A tree navigation changes the conversation the anchor was chosen for.
 	pi.on("session_tree", async (_event, ctx) => {
 		const key = ctx.sessionManager.getSessionId();
-		if (key) realUserLog.delete(key);
+		if (key) { realUserLog.delete(key); splitTurnProjection.delete(key); }
 		if (key) for (const level of Object.keys(FUSION_MODES)) planConversations.delete(planConvKey(key, level as PlannedFusionLevel));
 		if (key && conversations.get(key)?.routedFusion) {
 			conversations.delete(key);
