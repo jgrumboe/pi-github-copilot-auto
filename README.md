@@ -196,18 +196,40 @@ session token. The extension then:
 - reuses the plan for that turn's tool continuations and text-less turns, and
   sends the last completed step as `previous_turn` with the next plan request;
 - accepts only observed plan shapes (`solo` with one `generation` step;
-  `cascade`/`critique` starting with a `draft` step) and fails closed on
+  `cascade`/`critique` with several steps starting with a `draft` step) and fails closed on
   anything else, or on invalid or expiring plans (no fallback to another model).
 
-**Multi-step plans are only partly supported.** `solo` plans run as planned.
-`cascade` and `critique` plans list further steps (e.g. `escalation`/`repair`,
-`critic`/`revision`) that the native client executes itself; this extension
-does **not** execute them. It runs only the first (`draft`) step and says so in
-the footer and log (e.g. `fusion:high → gpt-6.1-sol (cascade, draft only)`). The
-draft model can be weaker than what a `solo` plan would have picked, and how
-GitHub bills a draft-only turn has not been verified. In a handful of sampled
-prompts, Max mostly returned `solo` plans and High returned multi-step plans for
-several coding/debugging prompts.
+**Multi-step plans** (`cascade`, `critique`) run in three stages, implemented
+independently in this extension (the native client's review prompts are not
+used):
+
+1. **Draft** — the plan's `draft` model answers as a normal pi turn, with pi's
+   tools and permissions. Footer: `fusion:high → gpt-6.1-sol (cascade: draft)`.
+2. **Review** — after the run finishes successfully, the plan's review step
+   (role `escalation` or `critic`) gets one separate, tool-less request with the
+   plan's token and effort: the latest request (without earlier conversation),
+   a compact record of the draft's tool activity and the draft answer, asking
+   for a JSON verdict (`accept`/`revise`, score, feedback). An unusable verdict
+   keeps the draft. The review is skipped when no fix could follow (no
+   interactive UI, or fixes declined for the session).
+3. **Fix** — if the reviewer asks for changes, pi shows a dialog with the
+   feedback: run the plan's `repair`/`revision` step (additional cost), keep the
+   draft, or always/never do so for the rest of the session (per Fusion level,
+   until `/reload`). When confirmed, a visible review message is appended —
+   framed as automated reviewer output that ranks below the original request,
+   capped at 2,000 characters — and pi continues **once** on the fix model; the
+   revised answer appears below the draft and its tool calls go through pi as
+   usual.
+
+The footer shows the outcome (`accepted by gpt-6-luna`, `repair after review`,
+`gpt-6-luna suggested changes; draft kept`, `review skipped, draft kept`,
+`review unavailable, draft kept`). Plans whose later steps have unknown roles
+run the draft and report `review unavailable`. The review and fix stages use
+pi's `agent_before_settle` boundary; on pi versions without it, multi-step plans
+run the draft only. The draft's tool effects are real before the review (there
+is no staging of writes), and how GitHub bills these turns has not been
+verified. In a handful of sampled prompts, Max mostly returned `solo` plans and
+High returned multi-step plans for several coding/debugging prompts.
 
 **Cost:** plans can select very expensive configurations (e.g. Max picked
 `claude-opus-5.5` at `max` effort; one such native turn reported about 17.5 AIU
@@ -270,7 +292,7 @@ Pick one of:
 - **`github-copilot-auto/auto-balance`** — balanced routing
 - **`github-copilot-auto/auto-intelligence`** — most capable models
 - **`github-copilot-fusion/standard`** — opt-in Copilot Fusion Standard (only when `/meta` confirms availability; run `/reload` after login)
-- **`github-copilot-fusion/high`**, **`github-copilot-fusion/max`** — opt-in Copilot Fusion High/Max (experimental; multi-step plans run draft only)
+- **`github-copilot-fusion/high`**, **`github-copilot-fusion/max`** — opt-in Copilot Fusion High/Max (experimental; multi-step plans: draft, review, fix on confirmation)
 
 Or run from shell:
 
@@ -419,7 +441,8 @@ fail-closed `/meta` entitlement discovery, the Fusion multi-turn cadence
 truncation, failures, forced checks after compaction, expiry, concurrency,
 classic↔Fusion switching), Fusion High/Max plans (discovery, solo execution
 with the plan token, exact step effort per transport, `previous_turn`, tool
-continuations, draft-only multi-step plans, invalid plans, summarizers),
+continuations, multi-step review/fix with confirmation and verdict variants,
+invalid plans, summarizers),
 real-user-turn identity and summarizer requests, signed history replay, token renewal/isolation, and HTTP headers
 across all three transports.
 
