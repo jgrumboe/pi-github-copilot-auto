@@ -27,6 +27,9 @@ const usage = { input: 11, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 
 const baseUrl = "https://api.individual.githubcopilot.com";
 let selectedId: string;
 let autoResponse: Record<string, unknown> | undefined;
+/** Per-/model/fusion-request override merged into the default plan (n is 1-based). */
+let planHook: ((body: Record<string, any>, n: number) => Record<string, unknown> | undefined) | undefined;
+let planStatus: number;
 /** Per-/auto-request override merged into the default response (n is 1-based). */
 let autoHook: ((body: Record<string, any>, n: number) => Record<string, unknown> | undefined) | undefined;
 let routeStatus: number;
@@ -64,7 +67,7 @@ async function loadExtension() {
 			return { ...(registeredModel ?? { id, name: id, reasoning: true, input: ["text"], cost: zeroCost, contextWindow: 200000, maxTokens: 64000 }),
 				api: "openai-completions", provider: "github-copilot-auto", baseUrl } as Model<Api>;
 		},
-		fusionModel: (): Model<Api> => ({ ...fusion.models[0], api: "openai-completions", provider: "github-copilot-fusion", baseUrl }) as Model<Api>,
+		fusionModel: (id = "standard"): Model<Api> => ({ ...(fusion.models.find(m => m.id === id) ?? { ...fusion.models[0], id }), api: "openai-completions", provider: "github-copilot-fusion", baseUrl }) as Model<Api>,
 		handlers,
 	};
 }
@@ -121,6 +124,8 @@ beforeEach(() => {
 	selectedId = "mai-code-1.1-flash";
 	autoResponse = undefined;
 	autoHook = undefined;
+	planHook = undefined;
+	planStatus = 200;
 	routeStatus = chatStatus = 200;
 	requests = [];
 	metaResponse = { auto: { tiers: [
@@ -146,6 +151,16 @@ beforeEach(() => {
 		}
 		const body = JSON.parse(typeof init?.body === "string" ? init.body : input instanceof Request ? await input.text() : "{}");
 		requests.push({ url, headers, body });
+		if (url === `${baseUrl}/model/fusion`) {
+			const n = requests.filter(r => r.url.endsWith("/model/fusion")).length;
+			return Response.json({
+				fusion_mode: body.fusion_mode, fusion_pattern: "solo", plan_version: "2", policy_version: "test", matched_rule: "solo_test",
+				hydra_scores: { code_gen: 0.1, debugging: 0.1, reasoning: 0.1, tool_use: 0.1 },
+				steps: [{ role: "generation", model_id: selectedId }],
+				session: { token: `test-plan-token-${n}`, expires_at: Math.floor(Date.now() / 1000) + 3600 },
+				...planHook?.(body, n),
+			}, { status: planStatus });
+		}
 		if (url === `${baseUrl}/auto`) {
 			const n = requests.filter(r => r.url.endsWith("/auto")).length;
 			return Response.json(autoResponse ?? {
@@ -172,7 +187,7 @@ afterEach(() => {
 describe("Fusion Standard entitlement discovery", () => {
 	it("checks /meta before advertising Standard, without routing or generating", async () => {
 		const ext = await loadExtension();
-		expect(ext.fusionModels.map(m => m.id)).toEqual(["standard"]);
+		expect(ext.fusionModels.map(m => m.id)).toEqual(["standard", "high"]);
 		expect(metaRequests).toHaveLength(1);
 		expect(metaRequests[0]).toMatchObject({ url: `${baseUrl}/meta`, method: "GET", body: undefined });
 		expect(metaRequests[0].headers.get("Authorization")).toBe("Bearer test-access-token");
@@ -200,10 +215,12 @@ describe("Fusion Standard entitlement discovery", () => {
 		["non-boolean flags", { auto: { tiers: [{ id: "balance", type: "auto", status: { enabled: "true", tier_picker_enabled: 1 } }, { id: "hydrafusion", type: "fusion", status: { enabled: true } }] } }],
 		["malformed Fusion status", { auto: { tiers: [{ id: "balance", type: "auto", status: { enabled: true } }, { id: "hydrafusion", type: "fusion", status: { enabled: "false" } }] } }],
 		["High and Max only", { auto: { tiers: ["hydrafusion", "hydrafusion-max"].map(id => ({ id, type: "fusion", status: { enabled: true, tier_picker_enabled: true } })) } }],
-	])("does not advertise Fusion for %s and leaves Auto usable", async (_label, data) => {
+	])("does not advertise Fusion Standard for %s and leaves Auto usable", async (_label, data) => {
 		metaResponse = data;
 		const ext = await loadExtension();
-		expect(ext.fusionModels).toEqual([]);
+		const tiers = (data as any)?.auto?.tiers;
+		const enabled = (id: string) => Array.isArray(tiers) && tiers.some((t: any) => t?.id === id && t?.type === "fusion" && t?.status?.enabled === true && t?.status?.tier_picker_enabled !== false);
+		expect(ext.fusionModels.map(m => m.id)).toEqual([...(enabled("hydrafusion") ? ["high"] : []), ...(enabled("hydrafusion-max") ? ["max"] : [])]);
 		expect(ext.models.map(m => m.id)).toEqual(["auto", "auto-efficiency", "auto-balance", "auto-intelligence"]);
 		const events = await collect(ext.stream(ext.model(), prompt));
 		expect(events.at(-1)?.type, finalMessage(events).errorMessage).toBe("done");
@@ -268,7 +285,7 @@ describe("Fusion Standard entitlement discovery", () => {
 
 	it("rechecks entitlement on restart rather than persisting availability", async () => {
 		const ext = await loadExtension();
-		expect(ext.fusionModels).toHaveLength(1);
+		expect(ext.fusionModels.map(m => m.id)).toEqual(["standard", "high"]);
 		vi.resetModules();
 		metaResponse = { auto: { tiers: [] } };
 		const restarted = await loadExtension();
@@ -471,6 +488,37 @@ describe("Fusion Standard multi-turn routing (observed native subset)", () => {
 		expect(JSON.stringify(bodies)).not.toContain("opaque-state");
 	});
 
+	it("shows the Standard routing state in the footer; toasts only on route changes", async () => {
+		autoHook = (_body, n) => (n === 3 ? { ...modelCards, hydra_scores: escalated, selected_model: { id: "gpt-4o" } } : modelCards);
+		const ext = await loadExtension();
+		const notify = vi.fn(), setStatus = vi.fn();
+		await ext.handlers.get("session_start")!({}, { ui: { notify, setStatus } });
+		await runTurns(ext, turns(6), "footer");
+		const m = selectedId;
+		expect(setStatus.mock.calls.map(c => c[1])).toEqual([
+			`fusion:standard \u2192 ${m} (anchor)`,
+			`fusion:standard \u2192 ${m} (checked, kept; next check in 3 turns)`,
+			`fusion:standard \u2192 ${m} (kept, next check in 2 turns)`,
+			`fusion:standard \u2192 ${m} (kept, next check in 1 turn)`,
+			"fusion:standard \u2192 gpt-4o (escalated)",
+			"fusion:standard \u2192 gpt-4o (checked, kept; next check in 3 turns)",
+		]);
+		expect(setStatus.mock.calls.every(c => c[0] === "copilot-fusion")).toBe(true);
+		expect(notify.mock.calls.map(c => c[0])).toEqual([
+			`Copilot Fusion Standard \u2192 ${m} (anchor)`,
+			"Copilot Fusion Standard \u2192 gpt-4o (escalated)",
+		]);
+	});
+
+	it("labels routes without multi-turn controls as anchor each turn", async () => {
+		autoHook = () => ({ ...modelCards, multi_turn_mode: undefined });
+		const ext = await loadExtension();
+		const setStatus = vi.fn();
+		await ext.handlers.get("session_start")!({}, { ui: { notify: vi.fn(), setStatus } });
+		await runTurns(ext, turns(2), "footer-off");
+		expect(setStatus.mock.calls.map(c => c[1])).toEqual(Array(2).fill(`fusion:standard \u2192 ${selectedId} (anchor each turn)`));
+	});
+
 	it("anchors every turn when pi supplied no real-user identities", async () => {
 		autoHook = () => modelCards;
 		const ext = await loadExtension();
@@ -636,12 +684,321 @@ describe("Real user-turn identity", () => {
 	});
 });
 
+describe("Fusion High and Max (server-authored plans)", () => {
+	const plannedMeta = (high = true, max = true) => ({ auto: { tiers: [
+		{ id: "balance", type: "auto", status: { enabled: true } },
+		{ id: "hydrafusion", type: "fusion", status: { enabled: high } },
+		{ id: "hydrafusion-max", type: "fusion", status: { enabled: max } },
+	] } });
+	const planBodies = () => requests.filter(r => r.url.endsWith("/model/fusion")).map(r => r.body);
+	const chats = () => requests.filter(r => !r.url.endsWith("/model/fusion") && !r.url.endsWith("/auto"));
+	async function turnsOn(ext: Awaited<ReturnType<typeof loadExtension>>, id: string, texts: string[], sessionId: string) {
+		const messages: Context["messages"] = [];
+		for (const [i, text] of texts.entries()) {
+			messages.push(user(text, (i + 1) * 10));
+			await ext.handlers.get("context")!({ type: "context", messages: [...messages] }, ctxFor(sessionId));
+			messages.push(finalMessage(await collect(ext.fusionStream(ext.fusionModel(id), { messages: [...messages] }, { sessionId }))));
+		}
+		return messages;
+	}
+
+	it.each([
+		[true, true, ["standard", "high", "max"]],
+		[true, false, ["standard", "high"]],
+		[false, true, ["standard", "max"]],
+		[false, false, ["standard"]],
+	])("advertises High=%s / Max=%s only when /meta enables them", async (high, max, ids) => {
+		metaResponse = plannedMeta(high, max);
+		const ext = await loadExtension();
+		expect(ext.fusionModels.map(m => m.id)).toEqual(ids);
+		expect(requests).toHaveLength(0);
+	});
+
+	it("does not advertise a hidden High tier", async () => {
+		metaResponse = { auto: { tiers: [
+			{ id: "balance", type: "auto", status: { enabled: true } },
+			{ id: "hydrafusion", type: "fusion", status: { enabled: true, tier_picker_enabled: false } },
+		] } };
+		const ext = await loadExtension();
+		expect(ext.fusionModels.map(m => m.id)).not.toContain("high");
+	});
+
+	it("runs a solo plan on its model with the plan's session token", async () => {
+		metaResponse = plannedMeta();
+		selectedId = "gpt-6-luna";
+		const ext = await loadExtension();
+		const messages = await turnsOn(ext, "high", ["first task"], "high-solo");
+		expect(planBodies()).toEqual([{ prompt: "first task", fusion_mode: "hydrafusion", plan_version: "2" }]);
+		const [plan] = requests.filter(r => r.url.endsWith("/model/fusion"));
+		expect(plan.headers.get("X-GitHub-Api-Version")).toBe("2026-08-01");
+		expect(plan.headers.has("Copilot-Session-Token")).toBe(false);
+		const [chat] = chats();
+		expect(new URL(chat.url).pathname).toBe("/responses");
+		expect(chat.body.model).toBe("gpt-6-luna");
+		expect(chat.headers.get("Copilot-Session-Token")).toBe("test-plan-token-1");
+		expect(messages.at(-1)).toMatchObject({ provider: "github-copilot-fusion", model: "high", responseModel: "gpt-6-luna", stopReason: "stop" });
+		expect(requests.some(r => r.url.endsWith("/auto"))).toBe(false);
+	});
+
+	it("uses max mode for the Max model", async () => {
+		metaResponse = plannedMeta();
+		const ext = await loadExtension();
+		await turnsOn(ext, "max", ["first task"], "max-solo");
+		expect(planBodies()[0].fusion_mode).toBe("hydrafusion-max");
+		expect(chats()[0].headers.get("Copilot-Session-Token")).toBe("test-plan-token-1");
+	});
+
+	const effortChecks: Record<string, (b: any) => void> = {
+		"/responses": (b) => expect(b.reasoning).toMatchObject({ effort: "max" }),
+		"/v1/messages": (b) => {
+			expect(b.output_config).toMatchObject({ effort: "max" });
+			expect(b.thinking).toMatchObject({ type: "adaptive", display: "summarized" });
+		},
+		"/chat/completions": (b) => expect(b.reasoning_effort).toBe("max"),
+	};
+	it.each(["gpt-5.3-codex", "claude-haiku-4.5", "gpt-4o", "mai-code-1.1-flash"])("sends the plan step's exact effort to %s", async (model) => {
+		metaResponse = plannedMeta();
+		chatStatus = 400; // Request serialization only.
+		planHook = () => ({ steps: [{ role: "generation", model_id: model, reasoning_effort: "max" }] });
+		const ext = await loadExtension();
+		await collect(ext.fusionStream(ext.fusionModel("max"), prompt, { sessionId: "effort", maxRetries: 0 }));
+		const [chat] = chats();
+		const path = new URL(chat.url).pathname;
+		const api = getModels("github-copilot").find(m => m.id === model)?.api;
+		if (api) expect(path).toBe(api === "openai-responses" ? "/responses" : api === "anthropic-messages" ? "/v1/messages" : "/chat/completions");
+		expect(chat.body.model).toBe(model);
+		effortChecks[path](chat.body);
+	});
+
+	it("runs a step without an effort at medium, as natively observed", async () => {
+		metaResponse = plannedMeta();
+		chatStatus = 400;
+		planHook = () => ({ steps: [{ role: "generation", model_id: "gpt-5.3-codex" }] });
+		const ext = await loadExtension();
+		await collect(ext.fusionStream(ext.fusionModel("high"), prompt, { sessionId: "no-effort", maxRetries: 0, reasoning: "xhigh" as never }));
+		expect(chats()[0].body.reasoning).toMatchObject({ effort: "medium" });
+	});
+
+	it("treats a null step effort as absent", async () => {
+		metaResponse = plannedMeta();
+		chatStatus = 400;
+		planHook = () => ({ steps: [{ role: "generation", model_id: "gpt-5.3-codex", reasoning_effort: null }] });
+		const ext = await loadExtension();
+		await collect(ext.fusionStream(ext.fusionModel("high"), prompt, { sessionId: "null-effort", maxRetries: 0 }));
+		expect(chats()[0].body.reasoning).toMatchObject({ effort: "medium" });
+	});
+
+	it("composes with a caller onPayload hook before applying the plan effort", async () => {
+		metaResponse = plannedMeta();
+		chatStatus = 400;
+		planHook = () => ({ steps: [{ role: "generation", model_id: "gpt-5.3-codex", reasoning_effort: "high" }] });
+		const ext = await loadExtension();
+		const onPayload = (p: any) => ({ ...p, reasoning: { ...p.reasoning, effort: "low" }, metadata: { tagged: true } });
+		await collect(ext.fusionStream(ext.fusionModel("high"), prompt, { sessionId: "hook", maxRetries: 0, onPayload } as never));
+		expect(chats()[0].body).toMatchObject({ metadata: { tagged: true }, reasoning: { effort: "high" } });
+	});
+
+	it("plans once per user turn, reuses it for tool continuations, and sends previous_turn", async () => {
+		metaResponse = plannedMeta();
+		selectedId = "gpt-6-luna";
+		planHook = (_b, n) => (n === 1 ? { steps: [{ role: "generation", model_id: "gpt-6-luna", reasoning_effort: "high" }] } : undefined);
+		const ext = await loadExtension();
+		const t1 = user("first task", 10);
+		await ext.handlers.get("context")!({ type: "context", messages: [t1] }, ctxFor("plan-turns"));
+		const toolCall = nativeMessage({ api: "openai-responses", model: "gpt-6-luna", stopReason: "toolUse",
+			content: [{ type: "toolCall", id: "call_1|fc_1", name: "read", arguments: { path: "a" } }] });
+		const continuation: Context = { messages: [t1, messageOf(asFusionEvent({ type: "done", reason: "toolUse", message: toolCall }, ext.fusionModel("high"))),
+			{ role: "toolResult", toolCallId: "call_1|fc_1", toolName: "read", content: [{ type: "text", text: "A" }], isError: false, timestamp: 11 }] };
+		await collect(ext.fusionStream(ext.fusionModel("high"), { messages: [t1] }, { sessionId: "plan-turns" }));
+		await collect(ext.fusionStream(ext.fusionModel("high"), continuation, { sessionId: "plan-turns" }));
+		expect(planBodies()).toHaveLength(1);
+		expect(chats().map(c => c.headers.get("Copilot-Session-Token"))).toEqual(["test-plan-token-1", "test-plan-token-1"]);
+		const t2 = user("second task", 20);
+		await ext.handlers.get("context")!({ type: "context", messages: [...continuation.messages, t2] }, ctxFor("plan-turns"));
+		await collect(ext.fusionStream(ext.fusionModel("high"), { messages: [...continuation.messages, t2] }, { sessionId: "plan-turns" }));
+		expect(planBodies()[1]).toEqual({ prompt: "second task", fusion_mode: "hydrafusion", plan_version: "2", previous_turn: { model_id: "gpt-6-luna", reasoning_effort: "high" } });
+		expect(chats().at(-1)!.headers.get("Copilot-Session-Token")).toBe("test-plan-token-2");
+	});
+
+	it("runs only the draft step of a multi-step plan", async () => {
+		metaResponse = plannedMeta();
+		chatStatus = 400;
+		planHook = () => ({ fusion_pattern: "cascade", steps: [
+			{ role: "draft", model_id: "gpt-5.3-codex", reasoning_effort: "medium" },
+			{ role: "escalation", model_id: "gpt-6-luna", reasoning_effort: "high" },
+			{ role: "repair", model_id: "claude-haiku-4.5", reasoning_effort: "medium" },
+		] });
+		const ext = await loadExtension();
+		const events = await collect(ext.fusionStream(ext.fusionModel("high"), prompt, { sessionId: "multi", maxRetries: 0 }));
+		expect(chats()).toHaveLength(1);
+		expect(chats()[0].body).toMatchObject({ model: "gpt-5.3-codex", reasoning: { effort: "medium" } });
+		expect(finalMessage(events)).toMatchObject({ provider: "github-copilot-fusion", model: "high" });
+	});
+
+	it.each([
+		["wrong mode", { fusion_mode: "hydrafusion-max" }],
+		["unknown plan version", { plan_version: "3" }],
+		["no steps", { steps: [] }],
+		["step without model", { steps: [{ role: "generation" }] }],
+		["unknown effort", { steps: [{ role: "generation", model_id: "gpt-6-luna", reasoning_effort: "ultra" }] }],
+		["missing session token", { session: { expires_at: Math.floor(Date.now() / 1000) + 3600 } }],
+		["expired session", { session: { token: "t", expires_at: 1 } }],
+		["unknown pattern", { fusion_pattern: "ensemble" }],
+		["solo with several steps", { steps: [{ role: "generation", model_id: "a" }, { role: "generation", model_id: "b" }] }],
+		["solo without a generation step", { steps: [{ role: "draft", model_id: "a" }] }],
+		["cascade with one step", { fusion_pattern: "cascade", steps: [{ role: "draft", model_id: "a" }] }],
+		["critique not starting with a draft", { fusion_pattern: "critique", steps: [{ role: "critic", model_id: "a" }, { role: "revision", model_id: "b" }] }],
+	])("fails closed on an invalid plan (%s)", async (_label, override) => {
+		metaResponse = plannedMeta();
+		planHook = () => override;
+		const ext = await loadExtension();
+		const events = await collect(ext.fusionStream(ext.fusionModel("high"), prompt, { sessionId: "invalid" }));
+		expect(finalMessage(events)).toMatchObject({ provider: "github-copilot-fusion", model: "high", stopReason: "error" });
+		expect(chats()).toHaveLength(0);
+	});
+
+	it("fails closed when /model/fusion returns an error", async () => {
+		metaResponse = plannedMeta();
+		planStatus = 500;
+		const ext = await loadExtension();
+		const events = await collect(ext.fusionStream(ext.fusionModel("high"), prompt, { sessionId: "plan-500" }));
+		expect(finalMessage(events).stopReason).toBe("error");
+		expect(chats()).toHaveLength(0);
+	});
+
+	it("refuses a level /meta did not enable", async () => {
+		metaResponse = plannedMeta(true, false);
+		const ext = await loadExtension();
+		const events = await collect(ext.fusionStream(ext.fusionModel("max"), prompt, { sessionId: "no-max" }));
+		expect(finalMessage(events)).toMatchObject({ model: "max", stopReason: "error" });
+		expect(requests).toHaveLength(0);
+	});
+
+	it("routes a summarizer under a throwaway session id via a one-off Standard route", async () => {
+		metaResponse = plannedMeta();
+		const ext = await loadExtension();
+		await turnsOn(ext, "max", ["real task"], "max-real");
+		await collect(ext.fusionStream(ext.fusionModel("max"), { messages: [user("Summarize the conversation", 99)] }, { sessionId: "uuid-summary" }));
+		expect(planBodies()).toHaveLength(1);
+		const route = requests.filter(r => r.url.endsWith("/auto"));
+		expect(route).toHaveLength(1);
+		expect(route[0].body).toMatchObject({ prompt: "Summarize the conversation", tier: "balance", fusion: true, multi_turn: { routing_intent: "anchor", turns_since_anchor: 0 } });
+		expect(chats().at(-1)!.headers.get("Copilot-Session-Token")).toBe("test-auto-token-1");
+	});
+
+	it("routes a same-session summary via Standard instead of the expensive plan step", async () => {
+		metaResponse = plannedMeta();
+		planHook = () => ({ steps: [{ role: "generation", model_id: "claude-haiku-4.5", reasoning_effort: "max" }] });
+		chatStatus = 400;
+		const ext = await loadExtension();
+		const t1 = user("real task", 10);
+		await ext.handlers.get("context")!({ type: "context", messages: [t1] }, ctxFor("aux-same"));
+		await collect(ext.fusionStream(ext.fusionModel("max"), { messages: [t1] }, { sessionId: "aux-same", maxRetries: 0 }));
+		await collect(ext.fusionStream(ext.fusionModel("max"), { messages: [user("Summarize", 99)] }, { sessionId: "aux-same", maxRetries: 0 }));
+		expect(planBodies()).toHaveLength(1);
+		expect(requests.filter(r => r.url.endsWith("/auto"))).toHaveLength(1);
+		expect(chats().at(-1)!.body.output_config).toBeUndefined();
+	});
+
+	it("without Standard, a summary reuses the current plan's model at medium effort", async () => {
+		metaResponse = { auto: { tiers: [{ id: "hydrafusion-max", type: "fusion", status: { enabled: true } }] } };
+		planHook = () => ({ steps: [{ role: "generation", model_id: "gpt-5.3-codex", reasoning_effort: "max" }] });
+		chatStatus = 400;
+		const ext = await loadExtension();
+		expect(ext.fusionModels.map(m => m.id)).toEqual(["max"]);
+		const t1 = user("real task", 10);
+		await ext.handlers.get("context")!({ type: "context", messages: [t1] }, ctxFor("aux-nostd"));
+		await collect(ext.fusionStream(ext.fusionModel("max"), { messages: [t1] }, { sessionId: "aux-nostd", maxRetries: 0 }));
+		await collect(ext.fusionStream(ext.fusionModel("max"), { messages: [user("Summarize", 99)] }, { sessionId: "aux-nostd", maxRetries: 0 }));
+		expect(planBodies()).toHaveLength(1);
+		expect(requests.some(r => r.url.endsWith("/auto"))).toBe(false);
+		expect(chats().map(c => c.body.reasoning?.effort)).toEqual(["max", "medium"]);
+		// A throwaway-id summary gets a one-off plan, also at medium.
+		await collect(ext.fusionStream(ext.fusionModel("max"), { messages: [user("Summarize", 99)] }, { sessionId: "uuid-nostd", maxRetries: 0 }));
+		expect(planBodies()).toHaveLength(2);
+		expect(chats().at(-1)!.body.reasoning?.effort).toBe("medium");
+	});
+
+	it("labels multi-step plans as draft only in the UI", async () => {
+		metaResponse = plannedMeta();
+		chatStatus = 400;
+		planHook = () => ({ fusion_pattern: "critique", steps: [
+			{ role: "draft", model_id: "gpt-5.3-codex", reasoning_effort: "medium" },
+			{ role: "critic", model_id: "gpt-6-luna", reasoning_effort: "high" },
+			{ role: "revision", model_id: "gpt-5.3-codex", reasoning_effort: "high" },
+		] });
+		const ext = await loadExtension();
+		const notify = vi.fn(), setStatus = vi.fn();
+		await ext.handlers.get("session_start")!({}, { ui: { notify, setStatus } });
+		await collect(ext.fusionStream(ext.fusionModel("high"), prompt, { sessionId: "label", maxRetries: 0 }));
+		expect(notify).toHaveBeenCalledWith(expect.stringContaining("critique: draft only"), "warning");
+		expect(setStatus).toHaveBeenCalledWith("copilot-fusion", "fusion:high \u2192 gpt-5.3-codex (critique, draft only)");
+	});
+
+	it("concurrent calls for one turn share a single plan", async () => {
+		metaResponse = plannedMeta();
+		const ext = await loadExtension();
+		const t1 = user("task", 10);
+		await ext.handlers.get("context")!({ type: "context", messages: [t1] }, ctxFor("plan-concurrent"));
+		await Promise.all([1, 2].map(() => collect(ext.fusionStream(ext.fusionModel("high"), { messages: [t1] }, { sessionId: "plan-concurrent" }))));
+		expect(planBodies()).toHaveLength(1);
+		expect(chats().map(c => c.headers.get("Copilot-Session-Token"))).toEqual(["test-plan-token-1", "test-plan-token-1"]);
+	});
+
+	it("an image-only turn reuses the current plan", async () => {
+		metaResponse = plannedMeta();
+		const ext = await loadExtension();
+		const messages = await turnsOn(ext, "high", ["first"], "plan-image");
+		const image = { role: "user" as const, timestamp: 20, content: [{ type: "image" as const, data: "dGVzdA==", mimeType: "image/png" }] };
+		await ext.handlers.get("context")!({ type: "context", messages: [...messages, image] }, ctxFor("plan-image"));
+		await collect(ext.fusionStream(ext.fusionModel("high"), { messages: [...messages, image] }, { sessionId: "plan-image" }));
+		expect(planBodies()).toHaveLength(1);
+		expect(chats().at(-1)!.headers.get("Copilot-Session-Token")).toBe("test-plan-token-1");
+	});
+
+	it("does not report a failed turn as previous_turn", async () => {
+		metaResponse = plannedMeta();
+		planHook = (_b, n) => ({ steps: [{ role: "generation", model_id: n === 1 ? "gpt-5.3-codex" : "gpt-6-luna" }] });
+		chatStatus = 400;
+		const ext = await loadExtension();
+		const t1 = user("first", 10);
+		await ext.handlers.get("context")!({ type: "context", messages: [t1] }, ctxFor("prev-fail"));
+		await collect(ext.fusionStream(ext.fusionModel("high"), { messages: [t1] }, { sessionId: "prev-fail", maxRetries: 0 }));
+		const t2 = user("second", 20);
+		await ext.handlers.get("context")!({ type: "context", messages: [t1, t2] }, ctxFor("prev-fail"));
+		await collect(ext.fusionStream(ext.fusionModel("high"), { messages: [t1, t2] }, { sessionId: "prev-fail", maxRetries: 0 }));
+		expect(planBodies()[1]).not.toHaveProperty("previous_turn");
+	});
+
+	it("keeps image input for plan models unknown to pi", async () => {
+		metaResponse = plannedMeta();
+		chatStatus = 400;
+		planHook = () => ({ steps: [{ role: "generation", model_id: "gpt-9-unknown" }] });
+		const ext = await loadExtension();
+		const imagePrompt: Context = { messages: [{ role: "user", timestamp: 1, content: [
+			{ type: "text", text: "Describe" }, { type: "image", data: "dGVzdA==", mimeType: "image/png" },
+		] }] };
+		await collect(ext.fusionStream(ext.fusionModel("high"), imagePrompt, { sessionId: "unknown-image", maxRetries: 0 }));
+		expect(JSON.stringify(chats()[0].body)).toContain("dGVzdA==");
+	});
+
+	it("tree navigation drops previous_turn", async () => {
+		metaResponse = plannedMeta();
+		const ext = await loadExtension();
+		await turnsOn(ext, "high", ["first"], "plan-tree");
+		await ext.handlers.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: null }, ctxFor("plan-tree"));
+		await ext.handlers.get("context")!({ type: "context", messages: [user("other", 30)] }, ctxFor("plan-tree"));
+		await collect(ext.fusionStream(ext.fusionModel("high"), { messages: [user("other", 30)] }, { sessionId: "plan-tree" }));
+		expect(planBodies()[1]).not.toHaveProperty("previous_turn");
+	});
+});
+
 describe("Auto response identity and resume", () => {
 	it("registers the Fusion Standard provider separately without changing Auto model IDs", async () => {
 		const ext = await loadExtension();
 		expect(ext.models.map(m => m.id)).toEqual(["auto", "auto-efficiency", "auto-balance", "auto-intelligence"]);
-		expect(ext.fusionModels.map(m => m.id)).toEqual(["standard"]);
-		expect(ext.fusionModels[0].name).toBe("Standard");
+		expect(ext.fusionModels.map(m => m.id)).toEqual(["standard", "high"]);
+		expect(ext.fusionModels.map(m => m.name)).toEqual(["Standard", "High"]);
 	});
 
 	it("persists Fusion identity and restores its actual producing model", async () => {

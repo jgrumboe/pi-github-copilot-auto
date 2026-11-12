@@ -275,32 +275,44 @@ function capiHeaders(token: string, sessionToken?: string): Record<string, strin
 	return headers;
 }
 
+/** Fusion levels the account's `/meta` metadata offers (startup snapshot). */
+type FusionAvailability = { standard: boolean; high: boolean; max: boolean };
+
 /** Check Standard availability and the provider's Fusion presentation signal. */
-function hasFusionStandardTier(data: unknown): boolean {
-	if (!data || typeof data !== "object") return false;
+function fusionTiersFromMeta(data: unknown): FusionAvailability {
+	const none = { standard: false, high: false, max: false };
+	if (!data || typeof data !== "object") return none;
 	const tiers = (data as { auto?: { tiers?: unknown } }).auto?.tiers;
-	if (!Array.isArray(tiers)) return false;
+	if (!Array.isArray(tiers)) return none;
 	const visible = (tier: any) => {
 		const status = tier?.status;
 		return status && typeof status === "object" && !Array.isArray(status)
 			&& (status.tier_picker_enabled === undefined || status.tier_picker_enabled === true);
 	};
+	const runnableFusion = (id: string) => tiers.some((tier) => tier && typeof tier === "object" && visible(tier)
+		&& tier.id === id && tier.type === "fusion" && tier.status.enabled === true);
 	// VS Code presents Auto as Fusion when it has a picker-visible Fusion tier,
 	// even if that tier itself is disabled. Balance alone also appears in classic
 	// Auto metadata, so it cannot establish Fusion presentation by itself.
-	return tiers.some((tier) => tier && typeof tier === "object" && visible(tier)
+	const standard = tiers.some((tier) => tier && typeof tier === "object" && visible(tier)
 		&& tier.id === "balance" && tier.type === "auto" && tier.status.enabled === true)
 		&& tiers.some((tier) => tier && typeof tier === "object" && visible(tier)
 			&& tier.type === "fusion" && typeof tier.status.enabled === "boolean");
+	return { standard, high: runnableFusion(FUSION_MODES.high), max: runnableFusion(FUSION_MODES.max) };
 }
 
-// A startup snapshot only: /reload (or restart) discovers entitlement changes.
-let fusionStandardAvailable = false;
+/** Fusion High/Max: pi model id -> `/model/fusion` `fusion_mode` (= `/meta` tier id). */
+const FUSION_MODES = { high: "hydrafusion", max: "hydrafusion-max" } as const;
+type PlannedFusionLevel = keyof typeof FUSION_MODES;
 
-async function discoverFusionStandard(): Promise<boolean> {
+// A startup snapshot only: /reload (or restart) discovers entitlement changes.
+let fusionAvailability: FusionAvailability = { standard: false, high: false, max: false };
+
+async function discoverFusion(): Promise<FusionAvailability> {
+	const none = { standard: false, high: false, max: false };
 	try {
 		const auth = await ensureToken();
-		if (!auth) return false;
+		if (!auth) return none;
 		const res = await fetch(`${auth.baseUrl}/meta`, {
 			method: "GET",
 			headers: { ...capiHeaders(auth.token), Accept: "application/json", "X-GitHub-Api-Version": COPILOT_META_API_VERSION },
@@ -308,16 +320,16 @@ async function discoverFusionStandard(): Promise<boolean> {
 		});
 		if (!res.ok) {
 			// Never log authenticated response bodies or credentials.
-			log(`Fusion Standard metadata unavailable: HTTP ${res.status}`);
-			return false;
+			log(`Fusion metadata unavailable: HTTP ${res.status}`);
+			return none;
 		}
-		const enabled = hasFusionStandardTier(await res.json());
-		log(`Fusion Standard metadata: available=${enabled}`);
-		return enabled;
+		const found = fusionTiersFromMeta(await res.json());
+		log(`Fusion metadata: standard=${found.standard} high=${found.high} max=${found.max}`);
+		return found;
 	} catch {
 		// Fail closed for Fusion, without breaking classic Auto or extension loading.
-		log("Fusion Standard metadata unavailable (request or parsing failed)");
-		return false;
+		log("Fusion metadata unavailable (request or parsing failed)");
+		return none;
 	}
 }
 
@@ -552,6 +564,10 @@ type ConvState = {
 	routedTurnKey?: string;
 	/** Fusion Standard multi-turn cadence for the current anchor route. */
 	fusion?: FusionCadence;
+	/** Footer note describing what Fusion Standard did on the current turn. */
+	fusionNote?: string;
+	/** Turn whose footer status was last shown. */
+	statusTurnKey?: string;
 };
 
 /**
@@ -719,7 +735,8 @@ async function routeFusionTurn(
 	token: string,
 	turn: UserTurn,
 	hasImage: boolean,
-): Promise<{ decision: AutoDecision; cadence: FusionCadence } | undefined> {
+): Promise<{ decision: AutoDecision; cadence: FusionCadence; note: string } | undefined> {
+	const turnsWord = (n: number) => `${n} turn${n === 1 ? "" : "s"}`;
 	const anchor = conv.decision;
 	const prior = conv.fusion;
 	const anchorUsable = anchor && prior && conv.routedFusion && conv.routedTier === FUSION_TIER && turn.identified
@@ -729,7 +746,7 @@ async function routeFusionTurn(
 		const since = prior.turnsSinceAnchor + 1;
 		if (!prior.forceCheck && since < prior.nextCheckAt) {
 			log(`fusion: turn ${since} since anchor inside skip window; reusing ${anchor.selectedModel.id}`);
-			return { decision: anchor, cadence: { ...prior, turnsSinceAnchor: since } };
+			return { decision: anchor, cadence: { ...prior, turnsSinceAnchor: since }, note: `kept, next check in ${turnsWord(prior.nextCheckAt - since)}` };
 		}
 		const drift = await fetchAutoDecision(baseUrl, token, driftPrompt(turn, controls, prior.historyStartKey), {
 			tier: FUSION_TIER,
@@ -746,11 +763,11 @@ async function routeFusionTurn(
 		if (!drift) {
 			// Unknown natively; retry on the next turn while the anchor stays valid.
 			log("fusion: drift check failed; continuing on the unexpired anchor");
-			return { decision: anchor, cadence: { ...prior, turnsSinceAnchor: since, nextCheckAt: since + 1 } };
+			return { decision: anchor, cadence: { ...prior, turnsSinceAnchor: since, nextCheckAt: since + 1 }, note: "check failed, kept" };
 		}
 		if (shouldEscalate(anchor, drift)) {
 			log(`fusion: drift check escalated ${anchor.selectedModel.id} -> ${drift.selectedModel.id}`);
-			return { decision: drift, cadence: anchorCadence(drift, true, { ...prior, historyStartKey }) };
+			return { decision: drift, cadence: anchorCadence(drift, true, { ...prior, historyStartKey }), note: "escalated" };
 		}
 		log(`fusion: drift check kept ${anchor.selectedModel.id} (router suggested ${drift.selectedModel.id})`);
 		return {
@@ -763,12 +780,13 @@ async function routeFusionTurn(
 				historyStartKey,
 				historyResetPending: false,
 			},
+			note: `checked, kept; next check in ${turnsWord(prior.window + 1)}`,
 		};
 	}
 	const fresh = await fetchAutoDecision(baseUrl, token, turn.prompt, {
 		tier: FUSION_TIER, hasImage, fusion: true, multiTurn: { ...ANCHOR_INTENT },
 	});
-	return fresh ? { decision: fresh, cadence: anchorCadence(fresh) } : undefined;
+	return fresh ? { decision: fresh, cadence: anchorCadence(fresh), note: fresh.driftControls ? "anchor" : "anchor each turn" } : undefined;
 }
 
 /**
@@ -802,6 +820,7 @@ async function ensureDecision(
 			if (!routed) return undefined;
 			conv.decision = routed.decision;
 			conv.fusion = routed.cadence;
+			conv.fusionNote = routed.note;
 		} else {
 			const d = await fetchAutoDecision(baseUrl, token, turn.prompt, { tier, hasImage });
 			// Never reuse an expired or differently-tiered token when re-routing fails.
@@ -826,10 +845,10 @@ async function ensureDecision(
 let uiNotify: ((msg: string, variant: "info" | "success" | "warning" | "error") => void) | undefined;
 let uiStatus: ((key: string, text: string) => void) | undefined;
 
-function announce(modelId: string, tier: AutoModeTier, fusion = false): void {
+function announce(modelId: string, tier: AutoModeTier, fusion = false, note?: string, toast = true): void {
 	if (fusion) {
-		uiNotify?.(`Copilot Fusion Standard → ${modelId}`, "info");
-		uiStatus?.("copilot-fusion", `fusion:standard → ${modelId}`);
+		if (toast) uiNotify?.(`Copilot Fusion Standard → ${modelId}${note ? ` (${note})` : ""}`, "info");
+		uiStatus?.("copilot-fusion", `fusion:standard → ${modelId}${note ? ` (${note})` : ""}`);
 		return;
 	}
 	uiNotify?.(`Auto (${tier}) → ${modelId}`, tier === "intelligence" ? "success" : "info");
@@ -875,6 +894,7 @@ function delegateStream(
 	token: string,
 	sessionToken: string,
 	fusion = false,
+	effort?: string,
 ): AssistantMessageEventStream {
 	// Merge case-insensitively so callers/catalog entries cannot accidentally
 	// append a second session token with different casing. Apply the same client
@@ -900,7 +920,19 @@ function delegateStream(
 	target = { ...target, headers: undefined };
 	context = fusion ? restoreFusionContext(context) : restoreAutoContext(context);
 	const innerOptions: SimpleStreamOptions = { ...options, apiKey: token, headers: Object.fromEntries(headers) };
-	log(`delegate: model=${target.id} api=${target.api} autoSessionToken=present`);
+	if (effort) {
+		// A Fusion plan step fixes the reasoning effort. Enable pi's reasoning path
+		// (thinking-capable request shape) and then set the exact plan value on the
+		// outgoing payload, independent of pi's own thinking-level mapping.
+		innerOptions.reasoning = "high" as SimpleStreamOptions["reasoning"];
+		const callerOnPayload = options?.onPayload;
+		const api = target.api;
+		innerOptions.onPayload = async (payload: unknown, m: Model<Api>) => {
+			const replaced = await (callerOnPayload as ((p: unknown, m: Model<Api>) => unknown) | undefined)?.(payload, m);
+			return applyStepEffort(replaced === undefined ? payload : replaced, api, effort);
+		};
+	}
+	log(`delegate: model=${target.id} api=${target.api}${effort ? ` effort=${effort}` : ""} autoSessionToken=present`);
 
 	switch (target.api) {
 		case "anthropic-messages":
@@ -933,7 +965,7 @@ function streamRouted(model: Model<Api>, context: Context, options: SimpleStream
 
 	(async () => {
 		try {
-			if (fusion && !fusionStandardAvailable) {
+			if (fusion && !fusionAvailability.standard) {
 				await fail("Copilot Fusion Standard is unavailable: /meta did not confirm an enabled, picker-visible Standard tier. Run /reload after login or entitlement changes.");
 				out.end();
 				return;
@@ -991,8 +1023,13 @@ function streamRouted(model: Model<Api>, context: Context, options: SimpleStream
 			// Resolve this request from its own decision, not mutable shared state.
 			const target = resolveTargetModel(decision.selectedModel, auth.baseUrl);
 			if (decision !== previousDecision && !ephemeral && !turn.auxiliary) {
-				announce(target.id, tier, fusion);
+				announce(target.id, tier, fusion, fusion ? conv.fusionNote : undefined);
 				log(`routed ${convKey ?? "unkeyed"} -> ${target.id} (tier=${tier}, fusion=${fusion})`);
+				conv.statusTurnKey = turn.key;
+			} else if (fusion && !ephemeral && !turn.auxiliary && conv.statusTurnKey !== turn.key && conv.routedTurnKey === turn.key) {
+				// Same route, new turn (skipped or kept after a drift check): footer only.
+				announce(target.id, tier, true, conv.fusionNote, false);
+				conv.statusTurnKey = turn.key;
 			}
 
 			// /auto supplies one selected model, not an eligible fallback pool. Do not
@@ -1015,6 +1052,298 @@ function streamAuto(model: Model<Api>, context: Context, options?: SimpleStreamO
 
 function streamFusionStandard(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	return streamRouted(model, context, options, true);
+}
+
+// ---------------------------------------------------------------------------
+// Fusion High / Max: server-authored plans (`POST /model/fusion`)
+// ---------------------------------------------------------------------------
+
+const FUSION_PLAN_VERSION = "2";
+const FUSION_PLAN_TIMEOUT_MS = 15_000;
+const STEP_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh", "max"]);
+
+type FusionPlanStep = { role: string; modelId: string; effort?: string };
+type FusionPlan = {
+	pattern: string;
+	matchedRule?: string;
+	steps: FusionPlanStep[];
+	sessionToken: string;
+	expiresAtMs: number;
+};
+
+/** Writes the plan step's reasoning effort into the API-specific request payload. */
+function applyStepEffort(payload: unknown, api: Api, effort: string): unknown {
+	if (!payload || typeof payload !== "object") return payload;
+	const p = payload as Record<string, any>;
+	switch (api) {
+		case "openai-responses":
+			return { ...p, reasoning: { ...(p.reasoning ?? {}), effort } };
+		case "anthropic-messages": {
+			// Observed natively: adaptive thinking with summarized display.
+			const thinking = p.thinking?.type === "adaptive" ? p.thinking : { type: "adaptive" };
+			return {
+				...p,
+				thinking: { ...thinking, display: thinking.display ?? "summarized" },
+				output_config: { ...(p.output_config ?? {}), effort },
+			};
+		}
+		default:
+			// Chat Completions: not observed natively; OpenAI-style field assumed.
+			return { ...p, reasoning_effort: effort };
+	}
+}
+
+/** Plan shapes that were observed; anything else fails closed. */
+function planShapeKnown(pattern: string, steps: FusionPlanStep[]): boolean {
+	if (pattern === "solo") return steps.length === 1 && steps[0].role === "generation";
+	if (pattern === "cascade" || pattern === "critique") return steps.length > 1 && steps[0].role === "draft";
+	return false;
+}
+
+function parseFusionPlan(data: unknown, mode: string): FusionPlan | undefined {
+	if (!data || typeof data !== "object") return undefined;
+	const d = data as Record<string, any>;
+	if (d.fusion_mode !== mode || d.plan_version !== FUSION_PLAN_VERSION || typeof d.fusion_pattern !== "string") return undefined;
+	if (!Array.isArray(d.steps) || !d.steps.length) return undefined;
+	const steps: FusionPlanStep[] = [];
+	for (const s of d.steps) {
+		if (!s || typeof s !== "object" || typeof s.role !== "string" || typeof s.model_id !== "string" || !s.model_id.trim()) return undefined;
+		const effort = s.reasoning_effort ?? undefined;
+		if (effort !== undefined && !(typeof effort === "string" && STEP_EFFORTS.has(effort))) return undefined;
+		steps.push({ role: s.role, modelId: s.model_id, ...(effort ? { effort } : {}) });
+	}
+	if (!planShapeKnown(d.fusion_pattern, steps)) return undefined;
+	const token = d.session?.token;
+	const expiresAtMs = typeof d.session?.expires_at === "number" ? d.session.expires_at * 1000 : NaN;
+	if (typeof token !== "string" || !token.trim()) return undefined;
+	if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now() + SESSION_REFRESH_SKEW_MS) return undefined;
+	return {
+		pattern: d.fusion_pattern,
+		...(typeof d.matched_rule === "string" ? { matchedRule: d.matched_rule } : {}),
+		steps,
+		sessionToken: token,
+		expiresAtMs,
+	};
+}
+
+function planSignal(signal: AbortSignal | undefined): AbortSignal {
+	const timeout = AbortSignal.timeout(FUSION_PLAN_TIMEOUT_MS);
+	return signal && typeof AbortSignal.any === "function" ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+async function fetchFusionPlan(
+	baseUrl: string,
+	token: string,
+	prompt: string,
+	mode: string,
+	previousTurn: { model_id: string; reasoning_effort?: string } | undefined,
+	signal?: AbortSignal,
+): Promise<FusionPlan | undefined> {
+	const body: Record<string, unknown> = { prompt, fusion_mode: mode, plan_version: FUSION_PLAN_VERSION };
+	if (previousTurn) body.previous_turn = previousTurn;
+	let res: Response;
+	try {
+		res = await fetch(`${baseUrl}/model/fusion`, {
+			method: "POST",
+			headers: capiHeaders(token),
+			body: JSON.stringify(body),
+			signal: planSignal(signal),
+		});
+	} catch (e) {
+		log(`fusion plan fetch failed: ${e instanceof Error ? e.name : "error"}`);
+		return undefined;
+	}
+	if (!res.ok) {
+		// Status only: authenticated response bodies are never logged.
+		log(`fusion plan non-ok: ${res.status}`);
+		return undefined;
+	}
+	const plan = parseFusionPlan(await res.json().catch(() => undefined), mode);
+	if (!plan) {
+		log("fusion plan response invalid, of an unknown shape, or expiring");
+		return undefined;
+	}
+	log(`fusion plan: mode=${mode} pattern=${plan.pattern} rule=${plan.matchedRule ?? "-"} steps=${plan.steps.map((s) => `${s.role}:${s.modelId}${s.effort ? `@${s.effort}` : ""}`).join(",")}`);
+	return plan;
+}
+
+type PlanConvState = {
+	plan?: FusionPlan;
+	planInflight?: Promise<FusionPlan | undefined>;
+	/** Real user turn the current plan was requested for. */
+	turnKey?: string;
+	/** Executed step of the last completed turn, sent as `previous_turn`. */
+	previousTurn?: { model_id: string; reasoning_effort?: string };
+};
+
+const planConversations = new Map<string, PlanConvState>();
+
+function planConvKey(sessionId: string, level: PlannedFusionLevel): string {
+	return `${sessionId}#${level}`;
+}
+
+/** Native steps without an explicit effort ran at medium. */
+const DEFAULT_STEP_EFFORT = "medium";
+
+function stepToExecute(plan: FusionPlan): { step: FusionPlanStep; effort: string; multiStep: boolean } {
+	// Solo plans have one generation step. Multi-step plans (cascade, critique)
+	// need client-side review phases that are not implemented: run only the first
+	// (draft) step, and say so.
+	const step = plan.steps[0];
+	return { step, effort: step.effort ?? DEFAULT_STEP_EFFORT, multiStep: plan.steps.length > 1 };
+}
+
+async function ensurePlan(conv: PlanConvState, baseUrl: string, token: string, turn: UserTurn, mode: string, signal?: AbortSignal): Promise<FusionPlan | undefined> {
+	const fresh = conv.plan && Date.now() < conv.plan.expiresAtMs - SESSION_REFRESH_SKEW_MS;
+	if (fresh && conv.turnKey === turn.key) return conv.plan;
+	if (conv.planInflight) {
+		await conv.planInflight;
+		return ensurePlan(conv, baseUrl, token, turn, mode, signal);
+	}
+	conv.planInflight = (async () => {
+		const plan = await fetchFusionPlan(baseUrl, token, turn.prompt, mode, conv.previousTurn, signal);
+		if (!plan) return undefined;
+		conv.plan = plan;
+		conv.turnKey = turn.key;
+		return plan;
+	})().finally(() => {
+		conv.planInflight = undefined;
+	});
+	return conv.planInflight;
+}
+
+function announcePlan(level: PlannedFusionLevel, plan: FusionPlan, step: FusionPlanStep, multiStep: boolean): void {
+	const name = level === "high" ? "High" : "Max";
+	const suffix = multiStep ? ` (${plan.pattern}: draft only, review phases not supported)` : "";
+	uiNotify?.(`Copilot Fusion ${name} \u2192 ${step.modelId}${suffix}`, multiStep ? "warning" : "info");
+	uiStatus?.("copilot-fusion", `fusion:${level} \u2192 ${step.modelId}${multiStep ? ` (${plan.pattern}, draft only)` : ""}`);
+}
+
+/** Auxiliary requests (summaries) never run above this effort on a plan step. */
+const AUX_STEP_EFFORT = "medium";
+
+function streamPlannedFusion(model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined): AssistantMessageEventStream {
+	const out = createAssistantMessageEventStream();
+	const level = model.id as PlannedFusionLevel;
+	const mode = FUSION_MODES[level];
+	const push = (event: Parameters<typeof asFusionEvent>[0]) => out.push(asFusionEvent(event, model));
+	const fail = async (message: string) => {
+		for await (const event of errorStream(message, FUSION_PROVIDER_ID, model.id)) push(event);
+	};
+	/** Streams the delegate; returns true when it finished without error/abort. */
+	const run = async (inner: AssistantMessageEventStream): Promise<boolean> => {
+		let ok = false;
+		for await (const event of inner) {
+			push(event);
+			if (event.type === "done") ok = true;
+			if (event.type === "error") ok = false;
+		}
+		return ok;
+	};
+
+	(async () => {
+		try {
+			if (!mode || !fusionAvailability[level]) {
+				await fail(`Copilot Fusion ${model.id} is unavailable: /meta did not report it as enabled. Run /reload after login or entitlement changes.`);
+				out.end();
+				return;
+			}
+			const auth = await ensureToken();
+			if (!auth) {
+				await fail("GitHub Copilot not authenticated. Run /login and select GitHub Copilot.");
+				out.end();
+				return;
+			}
+			const sessionId = options?.sessionId;
+			const ephemeral = !!sessionId && realUserTurns.size > 0 && !realUserTurns.has(sessionId);
+			const conv: PlanConvState = sessionId && !ephemeral ? getPlanConv(planConvKey(sessionId, level)) : {};
+			const turn = resolveUserTurn(context, sessionId);
+			const fresh = conv.plan && Date.now() < conv.plan.expiresAtMs - SESSION_REFRESH_SKEW_MS;
+
+			if (turn.auxiliary || ephemeral) {
+				// Summaries never run a High/Max plan at its planned effort: prefer a
+				// one-off Fusion Standard route; otherwise the current (or a one-off)
+				// plan's first step at medium effort. Nothing is stored or announced.
+				const prompt = turn.prompt.slice(-AUX_PROMPT_MAX_CHARS);
+				if (fusionAvailability.standard && prompt) {
+					const decision = await fetchAutoDecision(auth.baseUrl, auth.token, prompt, {
+						tier: FUSION_TIER, hasImage: hasImageInput(context), fusion: true, multiTurn: { ...ANCHOR_INTENT },
+					});
+					if (!decision) {
+						await fail("Failed to route a GitHub Copilot Fusion summary request (POST /auto).");
+						out.end();
+						return;
+					}
+					log(`fusion ${level}: auxiliary request routed via Standard -> ${decision.selectedModel.id}`);
+					await run(delegateStream(resolveTargetModel(decision.selectedModel, auth.baseUrl), context, options, auth.token, decision.sessionToken, true));
+					out.end();
+					return;
+				}
+				const auxPlan = fresh ? conv.plan : prompt ? await fetchFusionPlan(auth.baseUrl, auth.token, prompt, mode, undefined, options?.signal) : undefined;
+				if (!auxPlan) {
+					await fail(`Failed to plan GitHub Copilot Fusion ${model.id} (POST /model/fusion).`);
+					out.end();
+					return;
+				}
+				const { step } = stepToExecute(auxPlan);
+				log(`fusion ${level}: auxiliary request on ${step.modelId} at ${AUX_STEP_EFFORT} effort`);
+				await run(delegateStream(planTarget(step, auth.baseUrl), context, options, auth.token, auxPlan.sessionToken, true, AUX_STEP_EFFORT));
+				out.end();
+				return;
+			}
+
+			const previousPlan = conv.plan;
+			let plan: FusionPlan | undefined;
+			if (!turn.prompt) {
+				// Text-less turns (e.g. image-only) stay on the current plan.
+				plan = fresh ? conv.plan : undefined;
+				if (!plan) {
+					await fail(`Copilot Fusion ${model.id} needs a prompt to plan a request.`);
+					out.end();
+					return;
+				}
+			} else {
+				plan = await ensurePlan(conv, auth.baseUrl, auth.token, turn, mode, options?.signal);
+			}
+			if (!plan) {
+				await fail(`Failed to plan GitHub Copilot Fusion ${model.id} (POST /model/fusion).`);
+				out.end();
+				return;
+			}
+			const { step, effort, multiStep } = stepToExecute(plan);
+			if (plan !== previousPlan) {
+				announcePlan(level, plan, step, multiStep);
+				log(`planned ${sessionId ?? "unkeyed"} -> ${step.modelId} (${level}, ${plan.pattern}${multiStep ? ", draft only" : ""})`);
+			}
+			const ok = await run(delegateStream(planTarget(step, auth.baseUrl), context, options, auth.token, plan.sessionToken, true, effort));
+			// Report only executed, completed steps as the next plan's previous_turn.
+			if (ok && conv.plan === plan) conv.previousTurn = { model_id: step.modelId, ...(step.effort ? { reasoning_effort: step.effort } : {}) };
+			out.end();
+		} catch (e) {
+			await fail(e instanceof Error ? e.message : String(e));
+			out.end();
+		}
+	})();
+
+	return out;
+}
+
+/** Plan models unknown to pi's catalog keep image input (High/Max advertise it). */
+function planTarget(step: FusionPlanStep, baseUrl: string): Model<Api> {
+	return resolveTargetModel({ id: step.modelId, capabilities: { supports: { vision: true } } }, baseUrl);
+}
+
+function getPlanConv(key: string): PlanConvState {
+	let c = planConversations.get(key);
+	if (!c) {
+		c = {};
+		planConversations.set(key, c);
+	}
+	return c;
+}
+
+function streamFusion(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	return model.id === FUSION_MODEL_ID ? streamFusionStandard(model, context, options) : streamPlannedFusion(model, context, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,15 +1379,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	// Async factory discovery completes before startup/model selection (including
 	// --list-models and resume). Do not advertise an unverified entitlement.
-	fusionStandardAvailable = await discoverFusionStandard();
-	if (fusionStandardAvailable) {
+	fusionAvailability = await discoverFusion();
+	const fusionModels = [
+		...(fusionAvailability.standard ? [autoModel(FUSION_MODEL_ID, "Standard")] : []),
+		...(fusionAvailability.high ? [autoModel("high", "High")] : []),
+		...(fusionAvailability.max ? [autoModel("max", "Max")] : []),
+	];
+	if (fusionModels.length) {
 		pi.registerProvider(FUSION_PROVIDER_ID, {
 			name: "GitHub Copilot Fusion",
 			baseUrl: "https://api.individual.githubcopilot.com",
 			apiKey: "copilot-fusion",
 			api: "openai-completions",
-			streamSimple: streamFusionStandard as never,
-			models: [autoModel(FUSION_MODEL_ID, "Standard")],
+			streamSimple: streamFusion as never,
+			models: fusionModels,
 		});
 	}
 
@@ -1133,6 +1467,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.on("session_tree", async (_event, ctx) => {
 		const key = ctx.sessionManager.getSessionId();
 		if (key) realUserLog.delete(key);
+		if (key) for (const level of Object.keys(FUSION_MODES)) planConversations.delete(planConvKey(key, level as PlannedFusionLevel));
 		if (key && conversations.get(key)?.routedFusion) {
 			conversations.delete(key);
 			log(`fusion route cleared after tree navigation in session ${key}`);
