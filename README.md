@@ -152,11 +152,11 @@ did not force a check). Behaviour outside those observations (e.g. longer idle
 periods, `max_skip` saturation, or a stronger model suggested with fewer than
 `escalate_threshold` rising capabilities) may differ. Control values never
 observed (non-zero `anchor_skip`, a fractional `backoff_coefficient`) disable
-the cadence: such routes anchor every turn. Not reproduced: the server-driven
-`hydra_rl_multi_turn` `state_token`/`skip_turns` path (if a response carries any
-such state, the extension anchors every turn and never echoes it) and the
-native client's extra `gpt-5.4-nano` request, a user-message *sentiment
-telemetry* judge rather than routing. Native traces used the Copilot CLI's client
+the cadence: such routes anchor every turn. A non-empty `hydra_rl_multi_turn`
+object in a router response (never observed) also makes the extension anchor
+every turn; it is never echoed back. Not reproduced: an extra `gpt-5.4-nano`
+request the native client sent without a route token on later turns, which is
+not part of routing. Native traces used the Copilot CLI's client
 identity; this extension uses pi's existing `vscode-chat` identity.
 
 High and Max are not implemented: their native routing paths remain unverified.

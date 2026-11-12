@@ -450,8 +450,8 @@ describe("Fusion Standard multi-turn routing (observed native subset)", () => {
 		["three hydra_scores", { ...modelCards, hydra_scores: { code_gen: 1, debugging: 1, reasoning: 1 } }],
 		["non-finite hydra_scores", { ...modelCards, hydra_scores: { ...hydraScores, reasoning: "high" } }],
 		["invalid context window", { ...modelCards, multi_turn: { ...modelCards.multi_turn, context_window: 0 } }],
-		["server-driven state token", { ...modelCards, hydra_rl_multi_turn: { state_token: "opaque-state", skip_turns: 3 } }],
-		["server-driven skip_turns only", { ...modelCards, hydra_rl_multi_turn: { skip_turns: 3 } }],
+		["non-empty hydra_rl_multi_turn", { ...modelCards, hydra_rl_multi_turn: { opaque: "opaque-state" } }],
+		["non-empty hydra_rl_multi_turn (numeric)", { ...modelCards, hydra_rl_multi_turn: { n: 3 } }],
 		["scalar sigma", { ...modelCards, multi_turn: { ...modelCards.multi_turn, sigma: 0.2 } }],
 		["sigma missing a capability", { ...modelCards, multi_turn: { ...modelCards.multi_turn, sigma: { code_gen: 0.2, debugging: 0.2, reasoning: 0.2 } } }],
 		["escalate_threshold out of range", { ...modelCards, multi_turn: { ...modelCards.multi_turn, escalate_threshold: 5 } }],
@@ -467,7 +467,7 @@ describe("Fusion Standard multi-turn routing (observed native subset)", () => {
 			multi_turn: { routing_intent: "anchor", turns_since_anchor: 0 },
 		});
 		expect(chatTokens()).toEqual(["test-auto-token-1", "test-auto-token-2"]);
-		// Never echo or act on server-driven RL state.
+		// Never echo or act on unexpected multi-turn content.
 		expect(JSON.stringify(bodies)).not.toContain("opaque-state");
 	});
 

@@ -372,9 +372,9 @@ type AutoDecision = {
 function parseDriftControls(data: Record<string, unknown>): DriftControls | undefined {
 	const rl = data.hydra_rl_multi_turn;
 	if (rl && typeof rl === "object" && Object.keys(rl).length) {
-		// Server-driven RL multi-turn state (state_token/skip_turns) was never
-		// observed; its request echo is unknown. Never log or act on it.
-		log("auto: server-driven multi-turn state present; unsupported, anchoring each turn");
+		// Requests send `hydra_rl_multi_turn: {}`; a non-empty object in a response
+		// was never observed and its meaning is unknown. Never log, echo or act on it.
+		log("auto: unexpected hydra_rl_multi_turn content; anchoring each turn");
 		return undefined;
 	}
 	if (data.multi_turn_mode !== "model_cards") return undefined;
