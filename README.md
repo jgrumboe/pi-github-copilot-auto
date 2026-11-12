@@ -1,8 +1,11 @@
 # pi-github-copilot-auto
 
-Adds **`github-copilot-auto/auto`** models and an opt-in **`github-copilot-fusion/standard`** model to [pi](https://github.com/earendil-works/pi).
+Adds **`github-copilot-auto/auto`** models and opt-in **Copilot Fusion** models
+(`github-copilot-fusion/standard`, `/high`, `/max`) to [pi](https://github.com/earendil-works/pi).
 Auto follows GitHub Copilot's own server‑side auto model selection — the single‑call
-**AutoV2 router** (`POST /auto`). Fusion Standard is exposed as a separate model and uses the observed Fusion Standard routing flags.
+**AutoV2 router** (`POST /auto`). Fusion Standard uses the same router with the
+observed Fusion routing flags; Fusion High and Max use server-authored plans
+(`POST /model/fusion`).
 
 This started as a port of
 [opencode-github-copilot-auto-model](https://github.com/m0wer/opencode-github-copilot-auto-model)
@@ -140,6 +143,18 @@ follows the cadence observed in native Copilot CLI 1.0.109 traces:
   message (which may drop an escalated route), and fails closed if that fails.
   Native behaviour for an actually expired route was not observed.
 
+The footer shows what happened on each turn; a toast appears only when the
+route changes (anchor or escalation):
+
+| Footer | Meaning |
+|--------|---------|
+| `fusion:standard → gpt-6-luna (anchor)` | New anchor route |
+| `fusion:standard → gpt-6-luna (kept, next check in 2 turns)` | Skipped turn, no `/auto` call |
+| `fusion:standard → gpt-6-luna (checked, kept; next check in 5 turns)` | Drift check kept the route |
+| `fusion:standard → gpt-6.1-sol (escalated)` | Drift check adopted a stronger route |
+| `fusion:standard → gpt-6-luna (check failed, kept)` | Drift check failed; route kept, retried next turn |
+| `fusion:standard → gpt-6-luna (anchor each turn)` | No multi-turn controls offered |
+
 Only *real* typed user messages define turns and drift-check context: pi maps
 compaction/branch summaries, `!` bash output and extension messages to
 `role: "user"`, so the extension identifies real input (timestamp and text)
@@ -159,7 +174,49 @@ request the native client sent without a route token on later turns, which is
 not part of routing. Native traces used the Copilot CLI's client
 identity; this extension uses pi's existing `vscode-chat` identity.
 
-High and Max are not implemented: their native routing paths remain unverified.
+## Copilot Fusion High and Max (experimental, opt-in)
+
+Select **`github-copilot-fusion/high`** or **`github-copilot-fusion/max`**. They are
+offered only when `GET /meta` reports the `hydrafusion` (High) or
+`hydrafusion-max` (Max) tier as enabled and picker-visible.
+
+For each new real user turn the extension requests a **plan**:
+`POST /model/fusion` with `{ prompt, fusion_mode: "hydrafusion" | "hydrafusion-max",
+plan_version: "2", previous_turn: { model_id, reasoning_effort? } }` (API
+`2026-08-01`). The server answers with a pattern (`solo`, `cascade`,
+`critique`), steps (`role`, `model_id`, optional `reasoning_effort`) and a
+session token. The extension then:
+
+- runs the step's model through pi's native stream with the **plan's session
+  token**, setting the step's `reasoning_effort` exactly on the request
+  (`reasoning.effort` for Responses; adaptive `thinking` with summarized display
+  plus `output_config.effort` for Anthropic, as observed natively; for Chat
+  Completions an OpenAI-style `reasoning_effort` is assumed, not observed). Steps
+  without an effort run at `medium`, as observed natively;
+- reuses the plan for that turn's tool continuations and text-less turns, and
+  sends the last completed step as `previous_turn` with the next plan request;
+- accepts only observed plan shapes (`solo` with one `generation` step;
+  `cascade`/`critique` starting with a `draft` step) and fails closed on
+  anything else, or on invalid or expiring plans (no fallback to another model).
+
+**Multi-step plans are only partly supported.** `solo` plans run as planned.
+`cascade` and `critique` plans list further steps (e.g. `escalation`/`repair`,
+`critic`/`revision`) that the native client executes itself; this extension
+does **not** execute them. It runs only the first (`draft`) step and says so in
+the footer and log (e.g. `fusion:high → gpt-6.1-sol (cascade, draft only)`). The
+draft model can be weaker than what a `solo` plan would have picked, and how
+GitHub bills a draft-only turn has not been verified. In a handful of sampled
+prompts, Max mostly returned `solo` plans and High returned multi-step plans for
+several coding/debugging prompts.
+
+**Cost:** plans can select very expensive configurations (e.g. Max picked
+`claude-opus-5.5` at `max` effort; one such native turn reported about 17.5 AIU
+and 15 premium-request units). Summaries never run at a plan's effort: pi's
+compaction/branch summaries use a one-off Fusion Standard route when Standard is
+available, otherwise the current (or a one-off) plan's first step at `medium`.
+
+Plan shapes and request details were derived from observed traffic of the
+native client and direct plan requests; they are not a published contract.
 
 ## Install (pi package)
 
@@ -213,13 +270,15 @@ Pick one of:
 - **`github-copilot-auto/auto-balance`** — balanced routing
 - **`github-copilot-auto/auto-intelligence`** — most capable models
 - **`github-copilot-fusion/standard`** — opt-in Copilot Fusion Standard (only when `/meta` confirms availability; run `/reload` after login)
+- **`github-copilot-fusion/high`**, **`github-copilot-fusion/max`** — opt-in Copilot Fusion High/Max (experimental; multi-step plans run draft only)
 
 Or run from shell:
 
 ```bash
 pi --provider github-copilot-auto --model auto-intelligence
-# Or opt into Fusion Standard:
+# Or opt into Fusion Standard / High / Max:
 pi --provider github-copilot-fusion --model standard
+pi --provider github-copilot-fusion --model high
 ```
 
 ### 5) Verify package install (optional)
@@ -358,8 +417,10 @@ save → extension restart → resume → fresh route/token (including Responses
 fail-closed `/meta` entitlement discovery, the Fusion multi-turn cadence
 (skip windows, `max_skip`, escalation vs. sticky routes, drift-prompt window and
 truncation, failures, forced checks after compaction, expiry, concurrency,
-classic↔Fusion switching), real-user-turn identity and summarizer
-requests, signed history replay, token renewal/isolation, and HTTP headers
+classic↔Fusion switching), Fusion High/Max plans (discovery, solo execution
+with the plan token, exact step effort per transport, `previous_turn`, tool
+continuations, draft-only multi-step plans, invalid plans, summarizers),
+real-user-turn identity and summarizer requests, signed history replay, token renewal/isolation, and HTTP headers
 across all three transports.
 
 ## How it maps to pi
