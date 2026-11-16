@@ -180,6 +180,13 @@ Select **`github-copilot-fusion/high`** or **`github-copilot-fusion/max`**. They
 offered only when `GET /meta` reports the `hydrafusion` (High) or
 `hydrafusion-max` (Max) tier as enabled and picker-visible.
 
+**Effort level and execution pattern are distinct.** Standard, High, and Max
+are effort levels; they do not map one-to-one to `solo`, `cascade`, or
+`critique`. The server chooses an execution pattern for each prompt based on
+the task and requested effort, so the same level can produce different patterns
+for different prompts. Observed patterns are examples, not a guaranteed
+tier-to-pattern contract.
+
 For each new real user turn the extension requests a **plan**:
 `POST /model/fusion` with `{ prompt, fusion_mode: "hydrafusion" | "hydrafusion-max",
 plan_version: "2", previous_turn: { model_id, reasoning_effort? } }` (API
@@ -235,7 +242,9 @@ pi's `agent_before_settle` boundary; on pi versions without it, multi-step plans
 run the draft only. The draft's tool effects are real before the review (there
 is no staging of writes), and how GitHub bills these turns has not been
 verified. In a handful of sampled prompts, Max mostly returned `solo` plans and
-High returned multi-step plans for several coding/debugging prompts.
+High returned multi-step plans for several coding/debugging prompts; these
+observations are examples only and do not imply a fixed mapping between effort
+levels and execution patterns.
 
 **Cost and accounting:** review calls are separate and **not included in pi's
 session token or cost totals**. After a successful review, a notification shows
