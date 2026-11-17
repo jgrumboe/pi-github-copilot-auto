@@ -855,11 +855,13 @@ async function ensureDecision(
 
 let uiNotify: ((msg: string, variant: "info" | "success" | "warning" | "error") => void) | undefined;
 let uiStatus: ((key: string, text: string) => void) | undefined;
+let powerbarModelUpdate: ((level: string, modelId: string) => void) | undefined;
 
 function announce(modelId: string, tier: AutoModeTier, fusion = false, note?: string, toast = true): void {
 	if (fusion) {
 		if (toast) uiNotify?.(`Copilot Fusion Standard → ${modelId}${note ? ` (${note})` : ""}`, "info");
 		uiStatus?.("copilot-fusion", `fusion:standard → ${modelId}${note ? ` (${note})` : ""}`);
+		powerbarModelUpdate?.("standard", modelId);
 		return;
 	}
 	uiNotify?.(`Auto (${tier}) → ${modelId}`, tier === "intelligence" ? "success" : "info");
@@ -1242,6 +1244,7 @@ function announcePlan(level: PlannedFusionLevel, plan: FusionPlan, step: FusionP
 	const note = multiStep ? `${plan.pattern}: draft` : "";
 	uiNotify?.(`Copilot Fusion ${levelName(level)} \u2192 ${step.modelId}${note ? ` (${note})` : ""}`, "info");
 	uiStatus?.("copilot-fusion", `fusion:${level} \u2192 ${step.modelId}${note ? ` (${note})` : ""}`);
+	powerbarModelUpdate?.(level, step.modelId);
 }
 
 /** Auxiliary requests (summaries) never run above this effort on a plan step. */
@@ -1547,7 +1550,10 @@ async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: Settl
 		const { plan } = pending;
 		const draftStep = plan.steps[0];
 		const { review, fix } = reviewSteps(plan);
-		const status = (note: string, model = draftStep.modelId) => ui?.setStatus?.("copilot-fusion", `fusion:${level} \u2192 ${model} (${plan.pattern}: ${note})`);
+		const status = (note: string, model = draftStep.modelId) => {
+			ui?.setStatus?.("copilot-fusion", `fusion:${level} \u2192 ${model} (${plan.pattern}: ${note})`);
+			powerbarModelUpdate?.(level, model);
+		};
 		const prefKey = `${sessionId}#${level}`;
 		// Do not pay for a review that cannot lead to a fix.
 		if (fixPreference.get(prefKey) === "never" || !hasUI || !ui?.select || mode !== "tui" || !ui.onTerminalInput) {
@@ -1663,6 +1669,40 @@ function streamFusion(model: Model<Api>, context: Context, options?: SimpleStrea
 // ---------------------------------------------------------------------------
 
 export default async function (pi: ExtensionAPI): Promise<void> {
+	// Powerbar owns its model segment and refreshes it at every agent turn and
+	// thinking-level change. Observe those updates and restore our route after
+	// Powerbar processes them, independent of extension load order.
+	let powerbarRoute: { level: string; modelId: string } | undefined;
+	const emitPowerbarModel = (route: { level: string; modelId: string }, suffix: string) => {
+		pi.events.emit("powerbar:update", { id: "model", text: `${route.level} → ${route.modelId}${suffix}`, color: "dim" });
+	};
+	powerbarModelUpdate = pi.events ? (level, modelId) => {
+		powerbarRoute = { level, modelId };
+		const thinking = pi.getThinkingLevel?.();
+		emitPowerbarModel(powerbarRoute, thinking ? ` · ${thinking}` : "");
+	} : undefined;
+	pi.events?.on("powerbar:update", (data) => {
+		const update = data as { id?: unknown; text?: unknown } | undefined;
+		const route = powerbarRoute;
+		if (!route || update?.id !== "model" || typeof update.text !== "string") return;
+		const text = update.text;
+		if (text !== route.level && !text.startsWith(`${route.level} · `)) return;
+		// Run after the original emission's listeners, even if ours was loaded first.
+		queueMicrotask(() => {
+			if (powerbarRoute === route) emitPowerbarModel(route, text.slice(route.level.length));
+		});
+	});
+	const clearPowerbarRoute = (model?: Model<Api>) => {
+		if (!powerbarRoute) return;
+		powerbarRoute = undefined;
+		// If Powerbar already refreshed before this handler, undo any pending or
+		// earlier restoration and leave its normal selected-model display intact.
+		const thinking = model?.reasoning ? pi.getThinkingLevel?.() : undefined;
+		pi.events?.emit("powerbar:update", {
+			id: "model", text: model ? `${model.id}${thinking ? ` · ${thinking}` : ""}` : undefined, color: "dim",
+		});
+	};
+
 	const autoModel = (id: string, name: string) => ({
 		id,
 		name,
@@ -1720,7 +1760,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (ui?.setStatus) uiStatus = (k, t) => ui.setStatus?.(k, t);
 	};
 
-	pi.on("session_start", async (_e, ctx) => capture(ctx as never));
+	pi.on("session_start", async (_e, ctx) => {
+		clearPowerbarRoute(ctx.model);
+		capture(ctx as never);
+	});
+	pi.on("model_select", async (event) => clearPowerbarRoute(event.model));
+	pi.on("session_shutdown", async () => { powerbarRoute = undefined; });
 
 	const compactedSessionKey = (event: unknown): string | undefined => {
 		if (!event || typeof event !== "object") return undefined;
@@ -1794,6 +1839,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	// A tree navigation changes the conversation the anchor was chosen for.
 	pi.on("session_tree", async (_event, ctx) => {
+		clearPowerbarRoute(ctx.model);
 		const key = ctx.sessionManager.getSessionId();
 		if (key) { realUserLog.delete(key); splitTurnProjection.delete(key); }
 		if (key) for (const level of Object.keys(FUSION_MODES)) planConversations.delete(planConvKey(key, level as PlannedFusionLevel));

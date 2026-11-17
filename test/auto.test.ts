@@ -51,9 +51,19 @@ async function loadExtension() {
 	const { default: extension } = await import("../index.js");
 	const registrations = new Map<string, { streamSimple: Stream; models: Model<Api>[] }>();
 	const handlers = new Map<string, Function>();
+	const listeners = new Map<string, Array<(data: unknown) => void>>();
+	const powerbarEvents = vi.fn((name: string, data: unknown) => {
+		for (const listener of listeners.get(name) ?? []) listener(data);
+	});
+	const onBus = (name: string, fn: (data: unknown) => void) => {
+		listeners.set(name, [...(listeners.get(name) ?? []), fn]);
+		return () => {};
+	};
 	await extension({
 		registerProvider: (id: string, config: { streamSimple: Stream; models: Model<Api>[] }) => { registrations.set(id, config); },
 		on: (name: string, fn: Function) => handlers.set(name, fn),
+		getThinkingLevel: () => "medium",
+		events: { emit: powerbarEvents, on: onBus },
 	} as unknown as ExtensionAPI);
 	const auto = registrations.get("github-copilot-auto")!;
 	const fusion = registrations.get("github-copilot-fusion")!;
@@ -62,6 +72,8 @@ async function loadExtension() {
 		fusionModels: fusion?.models ?? [],
 		stream: auto.streamSimple,
 		fusionStream: fusion?.streamSimple as Stream,
+		powerbarEvents,
+		onBus,
 		model: (id = "auto-balance"): Model<Api> => {
 			const registeredModel = auto.models.find((m) => m.id === id);
 			return { ...(registeredModel ?? { id, name: id, reasoning: true, input: ["text"], cost: zeroCost, contextWindow: 200000, maxTokens: 64000 }),
@@ -537,10 +549,62 @@ describe("Fusion Standard multi-turn routing (observed native subset)", () => {
 			"fusion:standard \u2192 gpt-4o (checked, kept; next check in 3 turns)",
 		]);
 		expect(setStatus.mock.calls.every(c => c[0] === "copilot-fusion")).toBe(true);
+		expect(ext.powerbarEvents.mock.calls
+			.filter(([channel]) => channel === "powerbar:update")
+			.map(([, payload]) => payload)).toEqual([
+			{ id: "model", text: `standard → ${m} · medium`, color: "dim" },
+			{ id: "model", text: `standard → ${m} · medium`, color: "dim" },
+			{ id: "model", text: `standard → ${m} · medium`, color: "dim" },
+			{ id: "model", text: `standard → ${m} · medium`, color: "dim" },
+			{ id: "model", text: "standard → gpt-4o · medium", color: "dim" },
+			{ id: "model", text: "standard → gpt-4o · medium", color: "dim" },
+		]);
 		expect(notify.mock.calls.map(c => c[0])).toEqual([
 			`Copilot Fusion Standard \u2192 ${m} (anchor)`,
 			"Copilot Fusion Standard \u2192 gpt-4o (escalated)",
 		]);
+	});
+
+	it("restores Powerbar's route after model refreshes and clears it on selection or session changes", async () => {
+		autoHook = () => modelCards;
+		const ext = await loadExtension();
+		await ext.handlers.get("session_start")!({}, { ui: {} });
+		await runTurns(ext, ["first"], "powerbar-refresh");
+		const update = (text: string) => ext.powerbarEvents("powerbar:update", { id: "model", text, color: "dim" });
+		// Simulate Powerbar registering after this extension: the original event
+		// reaches its listener after ours, so restoration must happen afterward.
+		let visible = "";
+		ext.onBus("powerbar:update", (data: any) => { if (data.id === "model") visible = data.text; });
+
+		// Powerbar's turn_start and thinking_level_select emit the native model text.
+		update("standard · medium");
+		await Promise.resolve();
+		expect(ext.powerbarEvents).toHaveBeenLastCalledWith("powerbar:update", { id: "model", text: `standard → ${selectedId} · medium`, color: "dim" });
+		expect(visible).toBe(`standard → ${selectedId} · medium`);
+		update("standard · high");
+		await Promise.resolve();
+		expect(ext.powerbarEvents).toHaveBeenLastCalledWith("powerbar:update", { id: "model", text: `standard → ${selectedId} · high`, color: "dim" });
+
+		// A queued refresh cannot resurrect a route after switching models.
+		update("standard · medium");
+		await ext.handlers.get("model_select")!({ model: ext.model() });
+		await Promise.resolve();
+		expect(ext.powerbarEvents).toHaveBeenLastCalledWith("powerbar:update", { id: "model", text: "auto-balance · medium", color: "dim" });
+		update("standard · medium");
+		await Promise.resolve();
+		expect(ext.powerbarEvents).toHaveBeenLastCalledWith("powerbar:update", { id: "model", text: "standard · medium", color: "dim" });
+
+		await runTurns(ext, ["next"], "powerbar-new-session");
+		await ext.handlers.get("session_tree")!({}, { ...ctxFor("powerbar-new-session"), model: ext.fusionModel() });
+		update("standard · medium");
+		await Promise.resolve();
+		expect(visible).toBe("standard · medium");
+
+		await runTurns(ext, ["next"], "powerbar-another-session");
+		await ext.handlers.get("session_start")!({}, { model: ext.fusionModel(), ui: {} });
+		update("standard · medium");
+		await Promise.resolve();
+		expect(ext.powerbarEvents).toHaveBeenLastCalledWith("powerbar:update", { id: "model", text: "standard · medium", color: "dim" });
 	});
 
 	it("labels routes without multi-turn controls as anchor each turn", async () => {
@@ -980,6 +1044,7 @@ describe("Fusion High and Max (server-authored plans)", () => {
 		await collect(ext.fusionStream(ext.fusionModel("high"), prompt, { sessionId: "label", maxRetries: 0 }));
 		expect(notify).toHaveBeenCalledWith(expect.stringContaining("(critique: draft)"), "info");
 		expect(setStatus).toHaveBeenCalledWith("copilot-fusion", "fusion:high \u2192 gpt-5.3-codex (critique: draft)");
+		expect(ext.powerbarEvents).toHaveBeenCalledWith("powerbar:update", { id: "model", text: "high → gpt-5.3-codex · medium", color: "dim" });
 	});
 
 	it("concurrent calls for one turn share a single plan", async () => {

@@ -155,6 +155,12 @@ route changes (anchor or escalation):
 | `fusion:standard → gpt-6-luna (check failed, kept)` | Drift check failed; route kept, retried next turn |
 | `fusion:standard → gpt-6-luna (anchor each turn)` | No multi-turn controls offered |
 
+When `@juanibiapina/pi-powerbar` is installed and enabled, the extension also
+updates Powerbar's visible `model` segment with the concrete Fusion-routed model
+(e.g. `standard → gpt-6-luna · medium`). It remains visible across Powerbar
+refreshes until the route is cleared or the model or session changes. Without
+Powerbar, the native footer status continues to show the route as above.
+
 Only *real* typed user messages define turns and drift-check context: pi maps
 compaction/branch summaries, `!` bash output and extension messages to
 `role: "user"`, so the extension identifies real input (timestamp and text)
