@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -9,9 +9,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { asAutoEvent, asFusionEvent, restoreAutoContext, restoreFusionContext } from "../auto-identity.js";
 
 // Never read the developer's credentials/config or call a real Copilot endpoint.
+const home = vi.hoisted(() => ({ dir: "/nonexistent-copilot-auto-test-home" }));
 vi.mock("node:os", async (original) => ({
 	...await original<typeof import("node:os")>(),
-	homedir: () => "/nonexistent-copilot-auto-test-home",
+	homedir: () => home.dir,
 }));
 vi.mock("node:fs/promises", async (original) => ({
 	...await original<typeof import("node:fs/promises")>(),
@@ -137,6 +138,7 @@ function sseCompletion(endpoint: string, body: Record<string, any> = {}) {
 
 beforeEach(() => {
 	vi.resetModules();
+	home.dir = "/nonexistent-copilot-auto-test-home";
 	selectedId = "mai-code-1.1-flash";
 	autoResponse = undefined;
 	autoHook = undefined;
@@ -1118,6 +1120,21 @@ describe("Fusion High and Max (server-authored plans)", () => {
 			);
 		}
 
+		function writeConfig(config: object) {
+			const dir = mkdtempSync(path.join(tmpdir(), "copilot-auto-home-"));
+			tempDirs.push(dir);
+			mkdirSync(path.join(dir, ".pi", "agent"), { recursive: true });
+			writeFileSync(path.join(dir, ".pi", "agent", "github-copilot-auto.json"), JSON.stringify(config));
+			home.dir = dir;
+		}
+		// Like pi's RPC host: dialogs work, onTerminalInput is a no-op.
+		function settleRpc(ext: Awaited<ReturnType<typeof loadExtension>>, sessionId: string, messages: Context["messages"], select: any) {
+			return ext.handlers.get("agent_before_settle")!(
+				{ outcome: "completed", entries: [], context: { contextMessages: messages, canContinue: true } },
+				{ sessionManager: { getSessionId: () => sessionId }, ui: { select, onTerminalInput: () => () => {}, setStatus: vi.fn() }, hasUI: true, mode: "rpc" },
+			);
+		}
+
 		it("accepts a draft after a tool-less review on the plan's review model", async () => {
 			metaResponse = plannedMeta();
 			planHook = () => cascadePlan;
@@ -1214,18 +1231,42 @@ describe("Fusion High and Max (server-authored plans)", () => {
 			expect(reviews()).toHaveLength(0);
 		});
 
-		it("skips paid review in RPC because pi does not expose boundary abort", async () => {
+		it("skips the paid review in RPC unless rpcFix opts in", async () => {
 			metaResponse = plannedMeta(); planHook = () => cascadePlan;
 			const ext = await loadExtension();
 			const messages = await draftTurn(ext, "rev-rpc");
 			const select = vi.fn();
-			const result = await ext.handlers.get("agent_before_settle")!(
-				{ outcome: "completed", entries: [], context: { contextMessages: messages } },
-				{ sessionManager: { getSessionId: () => "rev-rpc" }, ui: { select }, hasUI: true, mode: "rpc" },
-			);
+			const result = await settleRpc(ext, "rev-rpc", messages, select);
 			expect(result).toBeUndefined();
 			expect(reviews()).toHaveLength(0);
 			expect(select).not.toHaveBeenCalled();
+		});
+
+		it("in RPC with rpcFix ask, reviews and shows the fix dialog", async () => {
+			writeConfig({ rpcFix: "ask" });
+			metaResponse = plannedMeta(); planHook = () => cascadePlan;
+			replyHook = verdict({ verdict: "revise", score: 2, feedback: "wrong" });
+			const ext = await loadExtension();
+			const messages = await draftTurn(ext, "rev-rpc-ask");
+			const select = vi.fn(async (_t: string, options: string[]) => options[0]);
+			const result = await settleRpc(ext, "rev-rpc-ask", messages, select);
+			expect(reviews()).toHaveLength(1);
+			expect(select).toHaveBeenCalledOnce();
+			expect(result).toMatchObject({ continue: true });
+		});
+
+		it.each([["always", true], ["never", false]] as const)("in RPC with rpcFix %s, decides the fix without a dialog", async (rpcFix, continues) => {
+			writeConfig({ rpcFix });
+			metaResponse = plannedMeta(); planHook = () => cascadePlan;
+			replyHook = verdict({ verdict: "revise", score: 2, feedback: "wrong" });
+			const ext = await loadExtension();
+			const messages = await draftTurn(ext, `rev-rpc-${rpcFix}`);
+			const select = vi.fn();
+			const result = await settleRpc(ext, `rev-rpc-${rpcFix}`, messages, select);
+			expect(reviews()).toHaveLength(1);
+			expect(select).not.toHaveBeenCalled();
+			if (continues) expect(result).toMatchObject({ continue: true });
+			else expect(result).toBeUndefined();
 		});
 
 		it.each(["\x1b", "\x1b[27u", "\x1b[27;1:1u", "\x1b[27;1;27~"])("cancels the reviewer on Escape encoding %j and does not prompt", async (escape) => {

@@ -224,8 +224,10 @@ used):
    a compact record of the draft's tool activity and the draft answer, asking
    for a JSON verdict (`accept`/`revise`, score, feedback). An unusable verdict
    keeps the draft. Press **Escape** during review to cancel it and keep the
-   draft. The review is skipped in RPC and non-interactive modes, when terminal
-   input is unavailable, or when fixes were declined for the session. Pi 1.5.1
+   draft. The review is skipped in non-interactive modes, when terminal
+   input is unavailable, or when fixes were declined for the session. It is also
+   skipped in RPC hosts (e.g. T3 Code) unless you opt in with `rpcFix` (see
+   *Optional configuration*); there Escape cannot cancel it. Pi 1.5.1
    does not expose a live abort signal to extensions at this boundary, so an
    external or programmatic abort may not cancel an in-progress TUI review; it
    is limited to 180 seconds.
@@ -421,6 +423,10 @@ Create `~/.pi/agent/github-copilot-auto.json` (all fields optional):
   // ("fast" is VS Code's internal inline-chat tier; usable but not recommended.)
   "tier": "balance",
 
+  // Opt in to the Fusion High/Max review in RPC hosts (e.g. T3 Code):
+  // "ask" (fix dialog), "always" or "never" run the repair. Unset: review skipped in RPC.
+  "rpcFix": "ask",
+
   // Write routing decisions to a log file (see below).
   "debug": false
 }
@@ -431,6 +437,7 @@ Create `~/.pi/agent/github-copilot-auto.json` (all fields optional):
 | `contextWindow` | number | Context window advertised for the `auto` entries (default 200000). |
 | `maxTokens` | number | Max output tokens advertised for the `auto` entries (default 64000). |
 | `tier` | string | Default tier for the bare `auto` model (default `balance`; legacy `balanced` accepted). |
+| `rpcFix` | string | Opt in to the review in RPC hosts: `ask` shows the fix dialog, `always` runs the repair, `never` keeps the draft. Use `always` or `never` for unattended runs. Unset: no review in RPC. |
 | `debug` | boolean | Enable the debug log. |
 
 ## Debugging

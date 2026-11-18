@@ -125,6 +125,11 @@ type Config = {
 	/** Default routing tier for the bare `auto` model. Defaults to `balance`. */
 	tier?: AutoModeTier;
 	debug?: boolean;
+	/**
+	 * Opt in to the Fusion High/Max review in RPC hosts (e.g. T3 Code), where Escape cannot cancel it.
+	 * Decides the repair step: "ask" (dialog), "always" or "never". Unset: the review is skipped in RPC.
+	 */
+	rpcFix?: "ask" | "always" | "never";
 };
 
 function loadConfig(): Config {
@@ -1503,9 +1508,10 @@ type SettleUi = {
 	notify?: (message: string, variant: "info" | "success" | "warning" | "error") => void;
 };
 
-async function confirmFix(prefKey: string, ui: SettleUi | undefined, hasUI: boolean, title: string, fix: FusionPlanStep): Promise<boolean> {
+async function confirmFix(prefKey: string, ui: SettleUi | undefined, hasUI: boolean, mode: string | undefined, title: string, fix: FusionPlanStep): Promise<boolean> {
 	const pref = fixPreference.get(prefKey);
 	if (pref) return pref === "always";
+	if (mode === "rpc" && (config.rpcFix === "always" || config.rpcFix === "never")) return config.rpcFix === "always";
 	if (!hasUI || !ui?.select) return false; // No way to ask: keep the cheaper draft.
 	const run = `Run ${fix.role} on ${fix.modelId} (additional cost)`;
 	const always = "Always run fixes in this session";
@@ -1556,7 +1562,7 @@ async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: Settl
 		};
 		const prefKey = `${sessionId}#${level}`;
 		// Do not pay for a review that cannot lead to a fix.
-		if (fixPreference.get(prefKey) === "never" || !hasUI || !ui?.select || mode !== "tui" || !ui.onTerminalInput) {
+		if (fixPreference.get(prefKey) === "never" || !hasUI || !ui?.select || (mode !== "tui" && !(mode === "rpc" && config.rpcFix)) || !ui.onTerminalInput) {
 			status("review skipped, draft kept");
 			log(`fusion ${level}: review skipped (no cancellable TUI confirmation, or fixes declined for the session)`);
 			continue;
@@ -1577,7 +1583,7 @@ async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: Settl
 			'Reply now with exactly one JSON object of this form and nothing else: {"verdict": "accept" | "revise", "score": <integer 1-5>, "feedback": "<specific problems and how to fix them; empty when accepting>"}',
 		].join("\n\n");
 		// Pi 1.5 has no active settle-boundary abort signal. In the TUI, capture
-		// Escape locally; RPC is skipped because its abort command is not exposed.
+		// Escape locally; RPC runs only when `rpcFix` opts in, bounded by the timeout and the host signal.
 		const controller = new AbortController();
 		const timeout = setTimeout(() => controller.abort(), REVIEW_TIMEOUT_MS);
 		const hostAbort = () => controller.abort();
@@ -1627,7 +1633,7 @@ async function reviewFusionTurn(event: SettleEvent, sessionId: string, ui: Settl
 		}
 		const shown = feedback.length > 200 ? `${feedback.slice(0, 200)}\u2026 (truncated)` : feedback;
 		const title = `Fusion ${levelName(level)}: ${review.modelId} suggests changes \u2014 ${shown}`;
-		if (!(await confirmFix(prefKey, ui, hasUI, title, fix))) {
+		if (!(await confirmFix(prefKey, ui, hasUI, mode, title, fix))) {
 			status(`${review.modelId} suggested changes; draft kept`);
 			ui?.notify?.(`Copilot Fusion ${levelName(level)} review: ${feedback}`, "info");
 			continue;
